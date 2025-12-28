@@ -62,6 +62,14 @@ def find_chunk_boundaries(
     return sorted(set(chunk_boundaries))
 
 
+def count_pretokens(txt: str, counter: Counter[str]):
+    "Pretokenize txt and count pretokens w/ counter."
+    # makes no sense to consider overlapped matches as it will produce
+    # tons of duplicated pre-tokens.
+    for m in re.finditer(PRE_TOKENIZE_PAT, txt):
+        counter[txt[m.start() : m.end()]] += 1
+
+
 def pretokenize(
     fp: Path,
     start: int,
@@ -96,14 +104,11 @@ def pretokenize(
     pieces_to_pretokenize = [
         p.lstrip() for p in re.split(special_tokens_pattern, chunk)
     ]
-    pre_token_cnts = Counter()
+    counter: Counter[str] = Counter()
     for p in pieces_to_pretokenize:
-        # makes no sense to consider overlapped matches as it will produce
-        # tons of duplicated pre-tokens.
-        for m in re.finditer(PRE_TOKENIZE_PAT, p):
-            pre_token_cnts[p[m.start() : m.end()]] += 1
+        count_pretokens(p, counter)
 
-    q_done.put(pre_token_cnts)
+    q_done.put(counter)
 
 
 @click.command(name="pretokenizer")
@@ -140,12 +145,12 @@ def run(infile: Path, outfile: Path):
         ).start()
 
     # aggregate pre token frequency count from each chunk
-    final_pre_token_cnts = Counter()
+    final_pretoken_counts = Counter()
     for _ in range(num_chunks):
-        final_pre_token_cnts += q_done.get()
+        final_pretoken_counts += q_done.get()
 
     with open(outfile, "wt", encoding="utf8") as f:
-        json.dump(final_pre_token_cnts, f)
+        json.dump(final_pretoken_counts, f)
 
 
 if __name__ == "__main__":
