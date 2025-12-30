@@ -70,7 +70,7 @@ def count_pretokens(txt: str, counter: Counter[str]):
         counter[txt[m.start() : m.end()]] += 1
 
 
-def pretokenize(
+def pretokenize_chunk(
     fp: Path,
     start: int,
     end: int,
@@ -99,16 +99,52 @@ def pretokenize(
     # Stories are separated by special tokens,
     # remove special tokens before pretokenization
     special_tokens_pattern = re.compile("|".join(re.escape(t) for t in special_tokens))
+    pieces_to_pretokenize = re.split(special_tokens_pattern, chunk)
     # NOTE per inspection in data I see there can exist lots of new lines
     # before each text piece begins; IMO we can trim such spaces away
-    pieces_to_pretokenize = [
-        p.lstrip() for p in re.split(special_tokens_pattern, chunk)
-    ]
+    # But UT is not happy with that - FAILED tests/test_train_bpe.py::test_train_bpe_special_tokens
+    # pieces_to_pretokenize = [
+    #        p.lstrip() for p in re.split(special_tokens_pattern, chunk)
+    # ]
     counter: Counter[str] = Counter()
     for p in pieces_to_pretokenize:
         count_pretokens(p, counter)
 
     q_done.put(counter)
+
+
+def pretokenize(
+    fp: Path,
+    split_special_token: bytes,
+    special_tokens: list[str],
+    worker_cnt: int | None = os.process_cpu_count(),
+) -> Counter[str]:
+    """
+    Pretokenzie the given corpus and output in-memory presentation of
+    pretoken -> count mapping.
+
+    fp: Path to file that contains corpus
+    worker_cnt: Number of worker processes to use for pretokenization. Default
+    to # CPU cores usable to the current thread.
+    """
+    with open(fp, "rb") as f:
+        assert worker_cnt is not None and worker_cnt > 0
+        boundaries = find_chunk_boundaries(f, worker_cnt, split_special_token)
+
+    # Parallelize this by sending each start/end pair to a set of processes.
+    num_chunks = len(boundaries) - 1
+    q_done = multiprocessing.Queue(num_chunks)
+    for start, end in zip(boundaries, boundaries[1:]):
+        multiprocessing.Process(
+            target=pretokenize_chunk, args=(fp, start, end, special_tokens, q_done)
+        ).start()
+
+    # aggregate pre token frequency count from each chunk
+    final_pretoken_counts: Counter[str] = Counter()
+    for _ in range(num_chunks):
+        final_pretoken_counts += q_done.get()
+
+    return final_pretoken_counts
 
 
 @click.command(name="pretokenizer")
@@ -131,26 +167,11 @@ def run(infile: Path, outfile: Path):
 
     1093.03s user 62.86s system 615% cpu 3:07.92 total
     """
-    with open(infile, "rb") as f:
-        num_processes = os.process_cpu_count()
-        assert num_processes is not None
-        boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
-
-    # Parallelize this by sending each start/end pair to a set of processes.
-    num_chunks = len(boundaries) - 1
-    q_done = multiprocessing.Queue(num_chunks)
-    for start, end in zip(boundaries, boundaries[1:]):
-        multiprocessing.Process(
-            target=pretokenize, args=(infile, start, end, ["<|endoftext|>"], q_done)
-        ).start()
-
-    # aggregate pre token frequency count from each chunk
-    final_pretoken_counts = Counter()
-    for _ in range(num_chunks):
-        final_pretoken_counts += q_done.get()
-
+    pretoken_cnts = pretokenize(
+        infile, split_special_token=b"<|endoftext|>", special_tokens=["<|endoftext|>"]
+    )
     with open(outfile, "wt", encoding="utf8") as f:
-        json.dump(final_pretoken_counts, f)
+        json.dump(pretoken_cnts, f)
 
 
 if __name__ == "__main__":
