@@ -162,4 +162,7 @@ cython_debug/
 .ruff_cache/
 *.zip
 
+# data directory
 data
+# profiling output
+*.prof

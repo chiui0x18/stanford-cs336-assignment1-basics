@@ -2,11 +2,13 @@ import json
 from collections import Counter, defaultdict
 import logging
 from pathlib import Path
-from heapq import heapify_max, heappop_max, heappush_max  # TODO use python 3.14
-from types import new_class
 from typing import DefaultDict
+from heapq import heapify_max, heappush_max, heappop_max  # requires python3.14
 from .log import get_logger  # logging logic in local module
-import click
+
+# Comment out imports like such which not needed by UTs to speed things up
+# TODO move the CLI logic to a different py module instead?
+# import click
 
 log = get_logger("bpe", level=logging.WARN)
 
@@ -74,12 +76,9 @@ def bpe_baseline(
     pretokens: dict[str, int], vocab_size: int, special_tokens: list[str]
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     """
-    TODO:
-    - UTs
+    Functional but inefficient BPE algo serving as baseline.
 
-    Train a BPE tokenizer from pre-tokenized input.
-
-    Spec:
+    Spec (maybe outdated, use code as authority when in doubt):
         1. Read pre-tokenized data from input_path, which is in form of a json
             object whose key is pre-token and value is the pre-token's frequency in
             text corpus, into a dict[tuple[bytes], int]
@@ -198,7 +197,7 @@ class Pretoken:
         return str((self.seq, self.cnt))
 
 
-def bpe_time_optimized(
+def bpe_optimized(
     pretokens: dict[str, int], vocab_size: int, special_tokens: list[str]
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     """
@@ -231,6 +230,27 @@ def bpe_time_optimized(
     the pair's occurrence, hence the efficiency increase. As mentioned above,
     such hypothesis can be false, which makes us find out the pair that has
     the 2nd highest count but doesn't overlap w/ p1.
+
+    Idea to remove the bottleneck: Use a max heap to track the next merged
+    pair. Item in the heap will be of PairCount type, and we will use
+    PairCount.valid = False to signal that an item is no longer valid because
+    the corresponding pair's count has changed. To preserve the correctness of
+    loose ordering b/w `PairCount` instances in the max heap, which allows us
+    to correctly track the next merged pair, we avoid updating the value of
+    `cnt` attribute of PairCount instances whenever we observe the count of a
+    token pair gets updated due to merge of token pair selected by BPE run.
+    Instead we set PairCount instance's `valid` attr to False upon change in
+    its count so that we are able to examine whether a PairCount instance we
+    pop from the max heap is valid or not (and keep popping until we find a
+    valid one or till heap is empty).
+    NOTE this is not very ideal (aka tracking the next merged pair which has
+    highest count and lexical order in O(1) time), but at least we no
+    longer need to sort all the known pair-cnt entries (O(nlgn)) - we will only
+    need 2 x |pairs w/ updated count| + |new pairs| heap push/pop operations,
+    (where 2x is due to popping invalid pairs and pushing updated pairs)
+    resulting time complexity of O((2 x |pairs w/ updated count| + |new pairs|)lgn)
+    NOTE such seemingly less-ideal solution turned out to provide us significant
+    speedup in BPE iteration process.
     """
 
     # Need a mapping from pretoken str -> token sequence which forms the
@@ -253,10 +273,11 @@ def bpe_time_optimized(
         new_token_id = len(vocab)
         vocab[new_token_id] = t.encode(UTF8)
 
-    # NOTE for bpe we only concern about tokens created from merging existing ones.
-    pair_cnts: Counter[tuple[bytes, bytes]] = Counter()
+    pair_cnts: dict[tuple[bytes, bytes], PairCount] = {}
     # token pair -> pretokens which contain such pair
     pair_to_pretokens: DefaultDict[tuple[bytes, bytes], set[str]] = defaultdict(set)
+    # PairCount max heap
+    pch: list[PairCount] = []
 
     # iterative BPE runs
     merged_p: tuple[bytes, bytes] | None = None
@@ -268,8 +289,13 @@ def bpe_time_optimized(
                 # Assumption: pt contains > 1 tokens. Iterate each token and
                 # collect pair of itself and its successor as merge candidate
                 for p in zip(v.seq, v.seq[1:]):
-                    pair_cnts[p] += v.cnt  # NOTE change in count is not 1!
+                    pc = pair_cnts.get(p, PairCount(p, 0))
+                    pc.cnt += v.cnt  # NOTE change in count is not 1!
+                    pair_cnts[p] = pc
                     pair_to_pretokens[p].add(pt)
+            # Build a max heap from created PairCount values, in linear time
+            pch = list(pair_cnts.values())
+            heapify_max(pch)
         elif len(pair_cnts) == 0:
             # Unlikely to happen; But if this was true then it means there are no more
             # new merged token to be created. So log and exit loop
@@ -283,117 +309,147 @@ def bpe_time_optimized(
             # which can be:
             # - A pair already in pair_cnts, OR
             # - A new pair resulted from creation of merged token from previous iteration
-            # and update mapping pair -> count and pair -> pretokens accordingly
-            for pt in pair_to_pretokens[merged_p]:
-                v = pretoken_info[pt]
-                updated_token_seq(pt, v, merged_p, pair_cnts, pair_to_pretokens)
-            # Drop merged_p's entry from pair_to_pretoken as it is longer needed
+            # Update mapping pair -> count, pair -> pretokens and pair count
+            # max heap accordingly
+            _update_iteration_states(
+                merged_p, pair_to_pretokens, pretoken_info, pair_cnts, pch
+            )
+            # The (old) merged pair is no longer needed so drop its entry
             pair_to_pretokens.pop(merged_p)
-
-        # Identified following as bottleneck of BPE run performance w/ cprofile & snakeviz
-        # TODO: This is to return the pair of highest count & lexical order and
-        # entails heapsort (O(nlgn) where n is # pairs in pair_cnts) each time
-        # it is called; Do we have a faster way than sorting every time?
-        merged_p = max(
-            pair_cnts, key=lambda p: PairCountSortKey(pair=p, cnt=pair_cnts[p])
-        )
+            if not pch:
+                log.warning(
+                    f"Cannot merge further as token pairs have run out. Actual vocab size: {len(vocab)} Expected: {vocab_size}"
+                )
+                break
+        # print(f'DEBUG: heap before removing the merged pair: {pch}')
+        merged_pc = heappop_max(pch)
+        merged_p = merged_pc.pair
         merged_token = b"".join(merged_p)
         new_token_id = len(vocab)
         vocab[new_token_id] = merged_token
         merges.append(merged_p)
         log.debug(
-            f"Merging pair {merged_p} of count {pair_cnts[merged_p]} to new token {new_token_id}"
+            f"Merging pair {merged_p} of count {pair_cnts[merged_p].cnt} to new token {new_token_id}"
         )
-        debug_pair_to_pretoken_info = {
-            p: [pretoken_info[pt] for pt in pts] for p, pts in pair_to_pretokens.items()
-        }
         # print(f'DEBUG: pair_cnts = {pair_cnts}\npair_to_pretokens = {debug_pair_to_pretoken_info}')
-        # Now remove the merged pair from pair_cnts to clear way for next merged pair
+        # The merged pair is no longer needed in pari_cnts so drop its entry
         pair_cnts.pop(merged_p)
 
     return vocab, merges
 
 
-def updated_token_seq(
-    pt: str,
-    ptv: Pretoken,
-    pair: tuple[bytes, bytes],
-    pair_cnts: Counter[tuple[bytes, bytes]],
+def _update_iteration_states(
+    p: tuple[bytes, bytes],
     pair_to_pretokens: DefaultDict[tuple[bytes, bytes], set[str]],
+    pretoken_info: dict[str, Pretoken],
+    pair_cnts: dict[tuple[bytes, bytes], PairCount],
+    pch: list[PairCount],
 ):
     """
-    Create updated token sequence of a pretoken given
-    its existing token sequence and the token pair to merge.
+    p: merged pair
 
-    This is to reflect the merge in the pretoken, the implication is that
-    pair(s) which previously overlap w/ pair to merge in pretoken are now
-    gone due to the merge, thus we must decrement their count accordingly
-
-    (In this light, using a heap to manage pair counts is more awkward as
-    update to items in heap are not straightforward -- one needs to find
-    the item, pop it out of heap, update count then push it back. So drop
-    such idea)
-
-    To compare w/ pair(s) which has no overlap to the merged pair and find the
-    next merged token (outside of this logic), save the count of *new* pairs
-    resulted from merging the merged token to pair_cnts!
-
-    pt: Pretoken string
-    ptv: `Pretoken` value contain pt's token sequence and corpus count
-    pair: Merged token pair
-    pair_cnts: Token pair counter
-    pair_to_pretokens: Mapping of pair to pretokens which contain the pair
+    Spec:
+    Invalidate PairCount values in pch whose pair's count has been updated,
+    besides updating other states. After a pair's count has been fully updated,
+    create a new PairCount value and push it to heap. Same for new pairs
+    created from merging the merged token.
     """
-    # replace all non-overlapping occurrences of token pair w/ new token
-    old = ptv.seq
-    idx, ln = 0, len(old)
-    new = []
-    merged_token = b"".join(pair)
-    # print(f'DEBUG: updating token sequence - merged pair {pair} pretoken str: "{pt}" token seq: {old}')
-    while idx < ln:
-        if idx < ln - 1 and old[idx] == pair[0] and old[idx + 1] == pair[1]:
-            new.append(merged_token)
-            # Find overlapping pairs and update their counts:
-            # (old[idx-1], old[idx]) and (old[idx+1], old[idx+2])
-            # Also record token(s) which can be built by merging
-            # the merged token and its neighbor.
-            # NOTE!!! Here pair count increments/decrements by
-            # pretoken's corpus count, not 1
-            if idx - 1 >= 0:
-                p_gone = (old[idx - 1], old[idx])
-                if p_gone in pair_cnts:
-                    pair_cnts[p_gone] -= ptv.cnt
-                    if pair_cnts[p_gone] == 0:
-                        pair_cnts.pop(p_gone)
+    new_pcs: dict[tuple[bytes, bytes], PairCount] = {}
+    for pt in pair_to_pretokens[p]:
+        ptv = pretoken_info[pt]
+        # replace all non-overlapping occurrences of token pair w/ new token
+        old = ptv.seq
+        idx, ln = 0, len(old)
+        new = []
+        merged_token = b"".join(p)
+        # print(f'DEBUG: updating token sequence - merged pair {pair} pretoken str: "{pt}" token seq: {old}')
+        while idx < ln:
+            if idx < ln - 1 and old[idx] == p[0] and old[idx + 1] == p[1]:
+                new.append(merged_token)
+                # Find overlapping pairs and update their counts:
+                # (old[idx-1], old[idx]) and (old[idx+1], old[idx+2])
+                # Also record token(s) which can be built by merging
+                # the merged token and its neighbor.
+                # NOTE!!! Here pair count increments/decrements by
+                # pretoken's corpus count, not 1
+                if idx - 1 >= 0:
+                    p_gone = (old[idx - 1], old[idx])
+                    if p_gone in pair_cnts:
+                        # NOTE default value is returned only when we see this
+                        # pair in the loop for the 1st time.
+                        pc = new_pcs.get(p_gone, pair_cnts[p_gone].copy())
+                        pc.cnt -= ptv.cnt
+                        new_pcs[p_gone] = pc
+                        # Invalidate the PairCount value from pair_cnts as its
+                        # count has changed. This will later help us discard
+                        # invalid PairCount values in the heap. NOTE this will
+                        # NOT break the loose ordering b/w items in heap; Updating
+                        # the count value of items in heap will, so avoid it.
+                        pair_cnts[p_gone].valid = False
+                        if pc.cnt == 0:
+                            # p_gone's gone for real; Remove its states to free
+                            # up mem space for future use
+                            pair_cnts.pop(p_gone)
+                            new_pcs.pop(p_gone)
+                            pair_to_pretokens.pop(p_gone)
 
-                new_p_w_merge_token = (old[idx - 1], merged_token)
-                pair_cnts[new_p_w_merge_token] += ptv.cnt
-                pair_to_pretokens[new_p_w_merge_token].add(pt)
-                # print(f'DEBUG: new pair w/ merged token {new_p_w_merge_token} - merged token {merged_token}')
+                    new_p_w_merge_token = (old[idx - 1], merged_token)
+                    new_pc_w_merge_token = new_pcs.get(
+                        new_p_w_merge_token, PairCount(new_p_w_merge_token, 0)
+                    )
+                    new_pc_w_merge_token.cnt += ptv.cnt
+                    new_pcs[new_p_w_merge_token] = new_pc_w_merge_token
+                    pair_to_pretokens[new_p_w_merge_token].add(pt)
+                    # print(f'DEBUG: new pair w/ merged token {new_p_w_merge_token} - merged token {merged_token}')
 
-            if idx + 2 < ln:
-                p_gone = (old[idx + 1], old[idx + 2])
-                if p_gone in pair_cnts:
-                    pair_cnts[p_gone] -= ptv.cnt
-                    if pair_cnts[p_gone] == 0:
-                        pair_cnts.pop(p_gone)
+                if idx + 2 < ln:
+                    p_gone = (old[idx + 1], old[idx + 2])
+                    # similar to paradigm above
+                    if p_gone in pair_cnts:
+                        pc = new_pcs.get(p_gone, pair_cnts[p_gone].copy())
+                        pc.cnt -= ptv.cnt
+                        new_pcs[p_gone] = pc
+                        pair_cnts[p_gone].valid = False
+                        if pair_cnts[p_gone] == 0:
+                            pair_cnts.pop(p_gone)
+                            new_pcs.pop(p_gone)
+                            pair_to_pretokens.pop(p_gone)
 
-                new_p_w_merge_token = (merged_token, old[idx + 2])
-                pair_cnts[new_p_w_merge_token] += ptv.cnt
-                pair_to_pretokens[new_p_w_merge_token].add(pt)
-                # print(f'DEBUG: new pair w/ merged token {new_p_w_merge_token} - merged token {merged_token}')
+                    new_p_w_merge_token = (merged_token, old[idx + 2])
+                    new_pc_w_merge_token = new_pcs.get(
+                        new_p_w_merge_token, PairCount(new_p_w_merge_token, 0)
+                    )
+                    new_pc_w_merge_token.cnt += ptv.cnt
+                    new_pcs[new_p_w_merge_token] = new_pc_w_merge_token
+                    pair_to_pretokens[new_p_w_merge_token].add(pt)
+                    # print(f'DEBUG: new pair w/ merged token {new_p_w_merge_token} - merged token {merged_token}')
+                idx += 2
+            else:
+                new.append(old[idx])
+                idx += 1
 
-            idx += 2
-        else:
-            new.append(old[idx])
-            idx += 1
+        ptv.seq = new
+    # Now we have collected pair -> count entries for:
+    # 1. Existent pairs whose count has been decremented (not down to 0)
+    # 2. New pairs built from merging the merged token
+    # Now restore the (count and lexical) ordering among pairs by putting
+    # these entries to pair_cnts and pair count max heap.
+    for pair, pc in new_pcs.items():
+        pair_cnts[pair] = pc
+        heappush_max(pch, pc)
+    # Finally pop the heap until we see a valid PairCount at heap top, which is
+    # the next merged pair
+    while pch and (not pch[0].valid or pch[0].cnt == 0):
+        heappop_max(pch)
 
-    ptv.seq = new
 
-
-class PairCountSortKey:
+class PairCount:
     """
-    Sort key to find token pair of highest count and largest lexical order.
+    Serves as a container of pair's info needed in BPE iteration run. Most
+    importantly, it acts as 1/ sort key to find token pair of highest count
+    and largest lexical order and 2/ a bag to carry important metadata, e.g.
+    the `valid` flag which initiates to True and flipped to False if the pair's
+    count changed during BPE iteration.
 
     NOTE this is a useful way to encapsulate complex comparison logic which
     cannot fit into a one-liner lambda function:
@@ -402,14 +458,19 @@ class PairCountSortKey:
     Before:
     sorted(pairs, key=lambda p: # cannot fit in logic to first compare count then lexical order! ...)
     After:
-    sorted(pairs, key=lambda p: PairCountSortKey(pair=p, cnt=pair_cnts[pair]))
+    sorted(pairs, key=lambda p: PairCount(pair=p, cnt=pair_cnts[pair]))
     """
 
     def __init__(self, pair: tuple[bytes, bytes], cnt: int) -> None:
         self.pair = pair
         self.cnt = cnt
+        # Check this when we pop a PairCount value from max heap
+        # Discard the value if it is false. NOTE value of this field
+        # shall NOT influence a PairCount's ordering in heap -- We
+        # shall refrain from deliberately violating heap's invariance.
+        self.valid = True
 
-    def __lt__(self, other: "PairCountSortKey") -> bool:
+    def __lt__(self, other: "PairCount") -> bool:
         """
         https://docs.python.org/3/reference/datamodel.html#object.__lt__
 
@@ -425,7 +486,11 @@ class PairCountSortKey:
         return self.pair < other.pair
 
     def __repr__(self) -> str:
-        return str((self.pair, self.cnt))
+        return str((self.pair, self.valid, self.cnt))
+
+    def copy(self) -> PairCount:
+        "Return a copy of itself."
+        return PairCount(self.pair, self.cnt)
 
 
 def train_bpe(
@@ -434,25 +499,25 @@ def train_bpe(
     with open(input_path, "r", encoding=UTF8) as f:
         pretokens: dict[str, int] = json.load(f)
 
-    return bpe_baseline(pretokens, vocab_size, special_tokens)
+    return bpe_optimized(pretokens, vocab_size, special_tokens)
 
 
-@click.command(name="bpe")
-@click.argument("infile", type=click.Path(exists=True, path_type=Path))
-@click.argument("size", type=click.INT)
-def run(infile: Path, size: int):
-    """
-    INFILE the file path of mapping of pretokens to their counts in text
-    corpus.
-
-    SIZE the size of vocabulary that byte-pair encoding logic will build.
-    """
-    train_bpe(
-        str(infile),
-        vocab_size=size,
-        special_tokens=["<|endoftext|>"],
-    )
-
-
-if __name__ == "__main__":
-    run()
+# @click.command(name="bpe")
+# @click.argument("infile", type=click.Path(exists=True, path_type=Path))
+# @click.argument("size", type=click.INT)
+# def run(infile: Path, size: int):
+#    """
+#    INFILE the file path of mapping of pretokens to their counts in text
+#    corpus.
+#
+#    SIZE the size of vocabulary that byte-pair encoding logic will build.
+#    """
+#    train_bpe(
+#        str(infile),
+#        vocab_size=size,
+#        special_tokens=["<|endoftext|>"],
+#    )
+#
+#
+# if __name__ == "__main__":
+#    run()

@@ -8,6 +8,9 @@ import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+from pathlib import Path
+from cs336_basics.pretokenizer import pretokenize
+from cs336_basics.bpe import bpe_optimized
 
 
 def run_linear(
@@ -452,7 +455,9 @@ def run_cross_entropy(
     raise NotImplementedError
 
 
-def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
+def run_gradient_clipping(
+    parameters: Iterable[torch.nn.Parameter], max_l2_norm: float
+) -> None:
     """Given a set of parameters, clip their combined gradients to have l2 norm at most max_l2_norm.
 
     Args:
@@ -589,4 +594,10 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    pretoken_cnts = pretokenize(
+        Path(input_path),
+        split_special_token=b"<|endoftext|>",
+        special_tokens=special_tokens,
+    )
+    return bpe_optimized(pretoken_cnts, vocab_size, special_tokens)
+    pass

@@ -5,7 +5,8 @@ from collections import Counter
 from pathlib import Path
 from typing import BinaryIO
 import regex as re
-import click
+
+# import click
 
 # for GPT-2
 PRE_TOKENIZE_PAT = re.compile(
@@ -147,32 +148,32 @@ def pretokenize(
     return final_pretoken_counts
 
 
-@click.command(name="pretokenizer")
-@click.argument("infile", type=click.Path(exists=True, path_type=Path))
-@click.argument("outfile", type=click.Path(exists=False, path_type=Path))
-def run(infile: Path, outfile: Path):
-    """
-    Spec:
-
-        For each chunk:
-            Start a worker process doing following:
-                1. Pre-tokenization that chunk
-                2. Return pre-tokenization output (type?) to a queue
-            Receive per-chunk output from queue and aggregate to a final output
-            Save the final output to a file on disk.
-
-    Performance:
-
-    $ time python3 cs336_basics/pretokenizer.py data/TinyStoriesV2-GPT4-train.txt  data/TinyStoriesV2-GPT4-train.txt.pretokens.json
-
-    1093.03s user 62.86s system 615% cpu 3:07.92 total
-    """
-    pretoken_cnts = pretokenize(
-        infile, split_special_token=b"<|endoftext|>", special_tokens=["<|endoftext|>"]
-    )
-    with open(outfile, "wt", encoding="utf8") as f:
-        json.dump(pretoken_cnts, f)
-
-
-if __name__ == "__main__":
-    run()
+# @click.command(name="pretokenizer")
+# @click.argument("infile", type=click.Path(exists=True, path_type=Path))
+# @click.argument("outfile", type=click.Path(exists=False, path_type=Path))
+# def run(infile: Path, outfile: Path):
+#    """
+#    Spec:
+#
+#        For each chunk:
+#            Start a worker process doing following:
+#                1. Pre-tokenization that chunk
+#                2. Return pre-tokenization output (type?) to a queue
+#            Receive per-chunk output from queue and aggregate to a final output
+#            Save the final output to a file on disk.
+#
+#    Performance:
+#
+#    $ time python3 cs336_basics/pretokenizer.py data/TinyStoriesV2-GPT4-train.txt  data/TinyStoriesV2-GPT4-train.txt.pretokens.json
+#
+#    1093.03s user 62.86s system 615% cpu 3:07.92 total
+#    """
+#    pretoken_cnts = pretokenize(
+#        infile, split_special_token=b"<|endoftext|>", special_tokens=["<|endoftext|>"]
+#    )
+#    with open(outfile, "wt", encoding="utf8") as f:
+#        json.dump(pretoken_cnts, f)
+#
+#
+# if __name__ == "__main__":
+#    run()
