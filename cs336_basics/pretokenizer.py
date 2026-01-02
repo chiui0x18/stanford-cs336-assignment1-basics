@@ -118,7 +118,7 @@ def pretokenize(
     fp: Path,
     split_special_token: bytes,
     special_tokens: list[str],
-    worker_cnt: int | None = os.process_cpu_count(),
+    worker_cnt: int | None = os.cpu_count(), # os.process_cpu_count(), requires python3.14
 ) -> Counter[str]:
     """
     Pretokenzie the given corpus and output in-memory presentation of

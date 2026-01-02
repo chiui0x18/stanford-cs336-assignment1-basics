@@ -1,13 +1,18 @@
 import json
 from collections import Counter, defaultdict
 import logging
-from pathlib import Path
-from typing import DefaultDict
-from heapq import heapify_max, heappush_max, heappop_max  # requires python3.14
+from collections.abc import Iterable, Iterator
+#from heapq import heapify_max, heappush_max, heappop_max  # requires python3.14
+from heapq import heapify, heappush, heappop  # before python3.14
+import math
+from itertools import chain
 from .log import get_logger  # logging logic in local module
+from .pretokenizer import PRE_TOKENIZE_PAT
+import regex as re
 
 # Comment out imports like such which not needed by UTs to speed things up
 # TODO move the CLI logic to a different py module instead?
+# from pathlib import Path
 # import click
 
 log = get_logger("bpe", level=logging.WARN)
@@ -33,7 +38,7 @@ class BpeIterationStates:
 
     def __init__(self) -> None:
         self.counter: Counter[tuple[bytes, bytes]] = Counter()
-        self.pair_to_pretokens: DefaultDict[
+        self.pair_to_pretokens: defaultdict[
             tuple[bytes, bytes], set[tuple[bytes, ...]]
         ] = defaultdict(set)
         self.max_cnt = 0
@@ -197,6 +202,67 @@ class Pretoken:
         return str((self.seq, self.cnt))
 
 
+class PairCount:
+    """
+    Serves as a container of pair's info needed in BPE iteration run. Most
+    importantly, it acts as 1/ sort key to find token pair of highest count
+    and largest lexical order and 2/ a bag to carry important metadata, e.g.
+    the `valid` flag which initiates to True and flipped to False if the pair's
+    count changed during BPE iteration.
+
+    NOTE this is a useful way to encapsulate complex comparison logic which
+    cannot fit into a one-liner lambda function:
+
+    Suppose pairs is a list of token pairs.
+    Before:
+    sorted(pairs, key=lambda p: # cannot fit in logic to first compare count then lexical order! ...)
+    After:
+    sorted(pairs, key=lambda p: PairCount(pair=p, cnt=pair_cnts[pair]))
+    """
+
+    def __init__(self, pair: tuple[bytes, bytes], cnt: int) -> None:
+        self.pair = pair
+        self.cnt = cnt
+        # Check this when we pop a PairCount value from max heap
+        # Discard the value if it is false. NOTE value of this field
+        # shall NOT influence a PairCount's ordering in heap -- We
+        # shall refrain from deliberately violating heap's invariance.
+        self.valid = True
+
+    def __lt__(self, other: "PairCount") -> bool:
+        """
+        https://docs.python.org/3/reference/datamodel.html#object.__lt__
+
+        This pair is deemed less than other if it has a lowr count, or it is
+        lexically smaller when there is a tie on count.
+
+        This seems to work w/ max() too as long as two values in comparison
+        is of same type. See https://stackoverflow.com/a/72880603
+        """
+        # Below works for python3.14 where we use heapq's max heap logic
+        #if self.cnt != other.cnt:
+        #    return self.cnt < other.cnt
+        ## A tie on count; Break it by lexical ordering
+        #return self.pair < other.pair
+
+        # Counterintuitive it seems, it is to work around the fact that
+        # python version < 3.14 doesn't have built in max heap logic and we
+        # need this to use a min heap as if it is a max heap.
+        if self.cnt != other.cnt:
+            return self.cnt > other.cnt
+        # A tie on count; Break it by lexical ordering
+        return self.pair > other.pair
+
+
+    def __repr__(self) -> str:
+        return str((self.pair, self.valid, self.cnt))
+
+    def copy(self) -> 'PairCount':
+        "Return a copy of itself."
+        return PairCount(self.pair, self.cnt)
+
+
+
 def bpe_optimized(
     pretokens: dict[str, int], vocab_size: int, special_tokens: list[str]
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
@@ -275,7 +341,7 @@ def bpe_optimized(
 
     pair_cnts: dict[tuple[bytes, bytes], PairCount] = {}
     # token pair -> pretokens which contain such pair
-    pair_to_pretokens: DefaultDict[tuple[bytes, bytes], set[str]] = defaultdict(set)
+    pair_to_pretokens: defaultdict[tuple[bytes, bytes], set[str]] = defaultdict(set)
     # PairCount max heap
     pch: list[PairCount] = []
 
@@ -295,7 +361,8 @@ def bpe_optimized(
                     pair_to_pretokens[p].add(pt)
             # Build a max heap from created PairCount values, in linear time
             pch = list(pair_cnts.values())
-            heapify_max(pch)
+            #heapify_max(pch) # requires python3.14
+            heapify(pch)
         elif len(pair_cnts) == 0:
             # Unlikely to happen; But if this was true then it means there are no more
             # new merged token to be created. So log and exit loop
@@ -322,7 +389,8 @@ def bpe_optimized(
                 )
                 break
         # print(f'DEBUG: heap before removing the merged pair: {pch}')
-        merged_pc = heappop_max(pch)
+        #merged_pc = heappop_max(pch) # requires python3.14
+        merged_pc = heappop(pch)
         merged_p = merged_pc.pair
         merged_token = b"".join(merged_p)
         new_token_id = len(vocab)
@@ -340,7 +408,7 @@ def bpe_optimized(
 
 def _update_iteration_states(
     p: tuple[bytes, bytes],
-    pair_to_pretokens: DefaultDict[tuple[bytes, bytes], set[str]],
+    pair_to_pretokens: defaultdict[tuple[bytes, bytes], set[str]],
     pretoken_info: dict[str, Pretoken],
     pair_cnts: dict[tuple[bytes, bytes], PairCount],
     pch: list[PairCount],
@@ -436,70 +504,202 @@ def _update_iteration_states(
     # these entries to pair_cnts and pair count max heap.
     for pair, pc in new_pcs.items():
         pair_cnts[pair] = pc
-        heappush_max(pch, pc)
+        #heappush_max(pch, pc) # requires python3.14
+        heappush(pch, pc)
     # Finally pop the heap until we see a valid PairCount at heap top, which is
     # the next merged pair
     while pch and (not pch[0].valid or pch[0].cnt == 0):
-        heappop_max(pch)
-
-
-class PairCount:
-    """
-    Serves as a container of pair's info needed in BPE iteration run. Most
-    importantly, it acts as 1/ sort key to find token pair of highest count
-    and largest lexical order and 2/ a bag to carry important metadata, e.g.
-    the `valid` flag which initiates to True and flipped to False if the pair's
-    count changed during BPE iteration.
-
-    NOTE this is a useful way to encapsulate complex comparison logic which
-    cannot fit into a one-liner lambda function:
-
-    Suppose pairs is a list of token pairs.
-    Before:
-    sorted(pairs, key=lambda p: # cannot fit in logic to first compare count then lexical order! ...)
-    After:
-    sorted(pairs, key=lambda p: PairCount(pair=p, cnt=pair_cnts[pair]))
-    """
-
-    def __init__(self, pair: tuple[bytes, bytes], cnt: int) -> None:
-        self.pair = pair
-        self.cnt = cnt
-        # Check this when we pop a PairCount value from max heap
-        # Discard the value if it is false. NOTE value of this field
-        # shall NOT influence a PairCount's ordering in heap -- We
-        # shall refrain from deliberately violating heap's invariance.
-        self.valid = True
-
-    def __lt__(self, other: "PairCount") -> bool:
-        """
-        https://docs.python.org/3/reference/datamodel.html#object.__lt__
-
-        This pair is deemed less than other if it has a lowr count, or it is
-        lexically smaller when there is a tie on count.
-
-        This seems to work w/ max() too as long as two values in comparison
-        is of same type. See https://stackoverflow.com/a/72880603
-        """
-        if self.cnt != other.cnt:
-            return self.cnt < other.cnt
-        # A tie on count; Break it by lexical ordering
-        return self.pair < other.pair
-
-    def __repr__(self) -> str:
-        return str((self.pair, self.valid, self.cnt))
-
-    def copy(self) -> PairCount:
-        "Return a copy of itself."
-        return PairCount(self.pair, self.cnt)
+        #heappop_max(pch) # requires python3.14
+        heappop(pch)
 
 
 def train_bpe(
     input_path: str, vocab_size: int, special_tokens: list[str]
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    with open(input_path, "r", encoding=UTF8) as f:
+    with open(input_path, encoding=UTF8) as f:
         pretokens: dict[str, int] = json.load(f)
 
     return bpe_optimized(pretokens, vocab_size, special_tokens)
+
+
+class Tokenizer:
+    '''
+    Tokenizer encodes given text to token sequence and decodes given token
+    sequence to text.
+    '''
+
+    def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes,
+                                                                   bytes]],
+                 special_tokens: list[str] | None =None) -> None:
+        '''
+        Spec:
+        Keep vocab for decoding token sequence to text.
+        Keep merges for encoding text to token sequence.
+        Need a way to look up a token's index given its bytes representation,
+        so need to build a reverse bytes -> int mapping from vocab.
+        For special tokens, first filter out those already existed in the
+        reversed index built from vocab, then assign new id to the remaining
+        ones and add mapping to both vocab and the reversed index, starting
+        from |vocab|.
+        '''
+        self.vocab  = vocab
+        # Merges need to proceed in the same order as merged pair creation so
+        # use index as ordering indicator -- A pass to find token pair to merge
+        # in a pretoken will need to find the pair of smallest index in mapping
+        # below.
+        self.merges: dict[tuple[bytes, bytes], int] = { p: idx for idx, p in
+                                                       enumerate(merges) }
+        # the reverse bytes -> int mapping from given vocab
+        self.bytes_to_token: dict[bytes, int] = { v: k for k, v in
+                                                 vocab.items() }
+        self.pretoken_to_tokens: dict[str, list[int]] = {}
+        self.pretokenize_pat = PRE_TOKENIZE_PAT
+        self.special_tokens_pat = None
+        special_tokens_regexes = []
+        if isinstance(special_tokens, list) :
+            # capture longer special tokens first so that we can treat
+            # repeated occurrence of special token as a single token
+            for t in sorted(special_tokens, reverse=True):
+                # to capture each special token in pretokenization
+                special_tokens_regexes.append(re.escape(t))
+                tb = t.encode(UTF8)
+                if tb not in self.bytes_to_token:
+                    new_token_id = len(vocab)
+                    vocab[new_token_id] = tb
+                    self.bytes_to_token[tb] = new_token_id
+                self.pretoken_to_tokens[t] = [self.bytes_to_token[tb]]
+
+            if special_tokens_regexes:
+                self.special_tokens_pat = re.compile('|'.join(special_tokens_regexes))
+
+    @classmethod
+    def from_files(cls, vocab_filepath: str, merges_filepath: str,
+                   special_tokens: list[str] | None = None) -> 'Tokenizer':
+        # TODO what does the content look like in vocab_filepath and merges_filepath?
+        with open(vocab_filepath) as f_vocab:
+            with open(merges_filepath) as f_merges:
+                # FIXME clawning for now
+                vocab = json.load(f_vocab)
+                merges = json.load(f_merges)
+                return cls(vocab, merges, special_tokens)
+
+    def encode(self, text: str) -> list[int]:
+        '''
+        Spec:
+
+        Pretokenize text. The result shall be:
+        1. A mapping of pretokens -> list[int], whose value set to None
+        2. A list of pretokens in order of given text.
+        NOTE before pretokenization we must split text by given special
+        tokens if any to avoid tokenizing the special tokens.
+
+        For each pretoken in the mapping, find corresponding token list by
+        merging the pretoken's byte-level presentation.
+
+        Finally compose the return value by initing an empty list l, then for
+        each pretoken in the list from point 2 above, extend l to
+        include the corresponding token list.
+
+        If encoding is called fairly frequently, it can be desirable for the
+        Toekenizer instance to maintain a pretoken -> token list mapping as an
+        attribute and use resulting cache effect to speed up encoding.
+        '''
+        txt_and_spt_pairs_iter = [(text, '')]
+        if self.special_tokens_pat:
+            # Python has handy, comprehensive builtins for dealing w/ iteration:
+            # https://docs.python.org/3/library/itertools.html
+            special_tokens_iter = chain(
+                map(
+                    lambda m: text[m.start() : m.end()],
+                    re.finditer(self.special_tokens_pat, text)),
+                # Below is necessary tomake the loop cover the last txt piece
+                # after splitting the given text by special tokens
+                [''],
+            )
+            txt_and_spt_pairs_iter = zip(
+                re.splititer(self.special_tokens_pat, text),
+                special_tokens_iter,
+            )
+
+        tokens = []
+        for txt, spt in txt_and_spt_pairs_iter:
+            # TODO what if txt is empty str?
+            for m in re.finditer(self.pretokenize_pat, txt):
+                pt = txt[m.start():m.end()]
+                if pt in self.pretoken_to_tokens:
+                    tokens.extend(self.pretoken_to_tokens[pt])
+                    continue
+                # TODO pt not in pretoken -> token list mapping; Compute token list
+                # and cache. Start merging from byte-level tokens
+                pt_tokens = [bytes([b]) for b in pt.encode(UTF8)]
+                # Enumerate the pairs in ptb and replace, until no replacement can
+                # be found. TODO finally cache the pretoken -> token list entry
+                # to self.pretoken_to_tokens
+                # Edge case: pretoken contains only 1 byte
+                while True:
+                    merged_p, merged_p_order = None, math.inf
+                    for p in zip(pt_tokens, pt_tokens[1:]):
+                        p_order = self.merges.get(p, math.inf)
+                        if p_order is not math.inf and p_order < merged_p_order:
+                            merged_p = p
+                            merged_p_order = p_order
+                    # Found pair to merge or it is still None. If it is latter
+                    # break, as no new merged pair is found; Otherwise replace token list
+                    # w/ one w/ the merged token.
+                    if merged_p is None:
+                        break
+                    merged_token = b''.join(merged_p)
+                    pt_tokens_w_merged_p = []
+                    idx, ln = 0, len(pt_tokens)
+                    while idx < ln:
+                        if idx < ln-1 and pt_tokens[idx] == merged_p[0] and pt_tokens[idx+1] == merged_p[1]:
+                            pt_tokens_w_merged_p.append(merged_token)
+                            idx+=2
+                        else:
+                            pt_tokens_w_merged_p.append(pt_tokens[idx])
+                            idx+=1
+                    # prepare for next merge run
+                    pt_tokens = pt_tokens_w_merged_p
+                # Now look up the id of final tokens given their bytes representation
+                pt_tokens = [ self.bytes_to_token[b] for b in pt_tokens ]
+                self.pretoken_to_tokens[pt] = pt_tokens
+                # finally extend the merged tokens to final token list
+                tokens.extend(pt_tokens)
+            # append id of special token to token list
+            if spt != '':
+                tokens.extend(self.pretoken_to_tokens[spt])
+
+        return tokens
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        '''
+        More on generator see:
+        - https://stackoverflow.com/a/1756156
+        - https://wiki.python.org/moin/Generators
+        Spec:
+
+        Iterate the given iterable - For each txt in iterable:
+            tokens = self.encode(txt)
+            for t in tokens:
+                yield t
+        '''
+        for txt in iterable:
+            yield from self.encode(txt)
+
+
+    def decode(self, ids: list[int]) -> str:
+        '''
+        Spec:
+        Start w/ an empty byte array.
+        For each token id in ids:
+            Look up vocab to get the bytes for token identified by id
+            Put the bytes into byte array
+        Decode byte array directly to str (feasible?)
+        '''
+        b = bytearray()
+        for t_id in ids:
+            b.extend(self.vocab[t_id])
+        return b.decode(encoding=UTF8, errors='replace')
 
 
 # @click.command(name="bpe")
