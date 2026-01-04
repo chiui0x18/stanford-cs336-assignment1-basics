@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from einops import einsum
+from einops import einsum, reduce, rearrange
 
 # TODO https://docs.pytorch.org/docs/stable/notes/randomness.html
 RNG_SEED = 10241
@@ -92,6 +92,13 @@ class Embedding(nn.Module):
         So looking up embedding vector by given token id, assemble the found
         vectors into a matrix then return is what embedding layer needs to do.
 
+        NOTE although embedding layer serves only as lookup table to map token
+        to vector in embedding space as part of the model's forward pass
+        computation, the parameters of embedding layer DO participate in
+        backpropagation and have to be updated per gradient descent. Therefore
+        embedding layer parameters are learned from LLM training process
+        instead of pre-trained and fixed up-front.
+
         The resulting matrix will be of shape (batch, seq_len, embedding_dim)
 
         To construct this matrix in imperative, non-linear algebra manner:
@@ -112,3 +119,45 @@ class Embedding(nn.Module):
         """
         # NOTE this returns a new copy
         return self.token_to_embedding_vector[token_ids]
+
+
+class RMSNorm(nn.Module):
+    """Root Mean Square normalization block."""
+
+    def __init__(
+        self,
+        d_model: int,
+        eps: float = 1e-5,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = torch.float32,
+    ) -> None:
+        """
+        d_model: Hidden dimension of the model, aka embedding vector size
+        eps: HYPERPARAM Epsilon value for numerical stability
+        """
+        super().__init__()
+        self.gains = nn.Parameter(torch.ones(d_model, dtype=dtype, device=device))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x in shape (batch_size, sequence_length, d_model)
+        """
+        in_dtype = x.dtype
+        # Q: shall we fix the dtype of model params (gains) to float32?
+        x = x.to(torch.float32)
+        d_model_size = x.shape[-1]
+        # Reduce along x's final dimension of size d_model in square sum
+        rms = torch.sqrt(
+            reduce(torch.square(x), "b s d_model -> b s", reduction="sum")
+            / d_model_size
+            + self.eps
+        )
+        # For element-wise division to work we need to satisfy the broadcasting semantics
+        # Here rms is in shape (b, s) while the dividend (number to be divided) in shape (b, s, d_model)
+        # Thus adjust rms to shape (b, s, 1) for broadcasting to work
+        rms = rearrange(rms, "b s -> b s 1")
+        # print(f'rms in shape {rms.shape}: {rms}')
+        # print(f'prod in shape {prod.shape}: {prod}')
+        res = x * self.gains / rms
+        return res.to(in_dtype)
