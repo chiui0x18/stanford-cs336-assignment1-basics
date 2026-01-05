@@ -1,10 +1,20 @@
+import random
+import logging
 import torch
+import numpy as np
 import torch.nn as nn
 from einops import einsum, reduce, rearrange
+from cs336_basics.log import get_logger
 
-# TODO https://docs.pytorch.org/docs/stable/notes/randomness.html
+# https://docs.pytorch.org/docs/stable/notes/randomness.html
+# NOTE this has negative performance implications so be aware when using it in
+# production
 RNG_SEED = 10241
+random.seed(RNG_SEED)
+np.random.seed(RNG_SEED)
+torch.manual_seed(RNG_SEED)
 
+log = get_logger('transformer', level=logging.DEBUG)
 
 class Linear(nn.Module):
     def __init__(
@@ -22,7 +32,6 @@ class Linear(nn.Module):
         """
         super().__init__()
         std = (2 / (in_features + out_features)) ** 0.5
-        torch.manual_seed(RNG_SEED)
         self.w = nn.Parameter(
             nn.init.trunc_normal_(
                 # Lay dimensions in row-major order for performant execution.
@@ -66,7 +75,6 @@ class Embedding(nn.Module):
         See https://docs.pytorch.org/docs/stable/generated/torch.nn.Embedding.html
         """
         super().__init__()
-        torch.manual_seed(RNG_SEED)
         # Mapping of token (identified by its id) -> The vector representing
         # the token in embedding space. For token whose id = i, its embedding
         # vector is the tensor of dimension=1 and shape=(embedding_dim,) at
@@ -161,3 +169,63 @@ class RMSNorm(nn.Module):
         # print(f'prod in shape {prod.shape}: {prod}')
         res = x * self.gains / rms
         return res.to(in_dtype)
+
+
+class FFN(nn.Module):
+    """Position-Wise Feed-Forward Network"""
+
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int | None = None,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__()
+        if d_ff is None:
+            # Per assignment recommendation, get the multiple of 64 closest to 8/3 x d_model
+            d_ff = max(round(8 * d_model / 3 / 64), 1) * 64
+            log.debug("Computed feed forward network dimension size: %d", d_ff)
+        self.w1 = nn.Parameter(
+            nn.init.trunc_normal_(
+                torch.empty(d_ff, d_model, dtype=dtype, device=device),
+                mean=0,
+                std=1,
+                a=-3,
+                b=3,
+            )
+        )
+        self.w3 = nn.Parameter(
+            nn.init.trunc_normal_(
+                torch.empty(d_ff, d_model, dtype=dtype, device=device),
+                mean=0,
+                std=1,
+                a=-3,
+                b=3,
+            )
+        )
+        self.w2 = nn.Parameter(
+            nn.init.trunc_normal_(
+                torch.empty(d_model, d_ff, dtype=dtype, device=device),
+                mean=0,
+                std=1,
+                a=-3,
+                b=3,
+            )
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Spec:
+
+        Different from math notation which is column-major, here we apply matrix operation in row-major manner.
+        """
+        # x_w1 = x @ self.w1.T
+        x_w1 = einsum(x, self.w1, "... d_model, d_ff d_model -> ... d_ff")
+        x_w1_sigmoid = x_w1 * torch.sigmoid(x_w1)
+        # x_w3 = x @ self.w3.T
+        x_w3 = einsum(x, self.w3, "... d_model, d_ff d_model -> ... d_ff")
+        # (x_w1_sigmoid * x_w3) @ self.w2.T
+        return einsum(
+            (x_w1_sigmoid * x_w3), self.w2, "... d_ff, d_model d_ff -> ... d_model"
+        )

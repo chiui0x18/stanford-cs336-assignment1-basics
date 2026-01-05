@@ -11,7 +11,7 @@ from torch import Tensor
 from pathlib import Path
 from cs336_basics.pretokenizer import pretokenize
 from cs336_basics.bpe import bpe_optimized, Tokenizer
-from cs336_basics.transformer import Linear, Embedding
+from cs336_basics.transformer import Linear, Embedding, RMSNorm, FFN
 
 
 def run_linear(
@@ -90,7 +90,13 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    m = FFN(d_model, d_ff)
+    m.load_state_dict({
+        'w1': w1_weight,
+        'w2': w2_weight,
+        'w3': w3_weight,
+    })
+    return m.forward(in_features)
 
 
 def run_scaled_dot_product_attention(
@@ -385,7 +391,9 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+    m = RMSNorm(d_model, eps)
+    m.load_state_dict({'gains': weights})
+    return m.forward(in_features)
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:

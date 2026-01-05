@@ -6,8 +6,8 @@ from collections.abc import Iterable, Iterator
 from heapq import heapify, heappush, heappop  # before python3.14
 import math
 from itertools import chain
-from .log import get_logger  # logging logic in local module
-from .pretokenizer import PRE_TOKENIZE_PAT
+from cs336_basics.log import get_logger  # logging logic in local module
+from cs336_basics.pretokenizer import PRE_TOKENIZE_PAT
 import regex as re
 
 # Comment out imports like such which not needed by UTs to speed things up
