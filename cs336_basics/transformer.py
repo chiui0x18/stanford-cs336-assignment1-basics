@@ -1,10 +1,13 @@
+from math import sin, cos
 import random
 import logging
 import torch
+from torch import Tensor
 import numpy as np
 import torch.nn as nn
 from einops import einsum, reduce, rearrange
 from cs336_basics.log import get_logger
+from jaxtyping import Float
 
 # https://docs.pytorch.org/docs/stable/notes/randomness.html
 # NOTE this has negative performance implications so be aware when using it in
@@ -14,7 +17,8 @@ random.seed(RNG_SEED)
 np.random.seed(RNG_SEED)
 torch.manual_seed(RNG_SEED)
 
-log = get_logger('transformer', level=logging.DEBUG)
+log = get_logger("transformer", level=logging.DEBUG)
+
 
 class Linear(nn.Module):
     def __init__(
@@ -92,6 +96,7 @@ class Embedding(nn.Module):
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         """
         token_ids: A tensor of long type of shape (batch, seq_len)
+        return: A tensor of token embeddings of shape (batch, seq_len, embedding_dim)
 
         Spec:
         Embedding layer serves as a mapping from individual token (identified
@@ -149,7 +154,8 @@ class RMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x in shape (batch_size, sequence_length, d_model)
+        x: in shape (batch_size, sequence_length, d_model)
+        return: A tensor of shape (batch_size, sequence_length, d_model)
         """
         in_dtype = x.dtype
         # Q: shall we fix the dtype of model params (gains) to float32?
@@ -183,8 +189,8 @@ class FFN(nn.Module):
     ) -> None:
         super().__init__()
         if d_ff is None:
-            # Per assignment recommendation, get the multiple of 64 closest to 8/3 x d_model
-            d_ff = max(round(8 * d_model / 3 / 64), 1) * 64
+            # set d_ff = 8/3 x d_model to minimize loss increase
+            d_ff = 8 * d_model // 3
             log.debug("Computed feed forward network dimension size: %d", d_ff)
         self.w1 = nn.Parameter(
             nn.init.trunc_normal_(
@@ -228,4 +234,107 @@ class FFN(nn.Module):
         # (x_w1_sigmoid * x_w3) @ self.w2.T
         return einsum(
             (x_w1_sigmoid * x_w3), self.w2, "... d_ff, d_model d_ff -> ... d_model"
+        )
+
+
+class RotaryPositionalEmbedding(nn.Module):
+    def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None) -> None:
+        """
+        This module is used in transformer model component "Causal Multi-Head Self-Attention w/ RoPE"
+        Its input is the output of pre-norm layer, in shape (batch_size, seq_len, d_embedding)
+
+        This is how we model positions in a transformer, aka encoding position-specific
+        info into the transformer model.
+        See https://youtu.be/ptFiH_bHnJw?list=PLoROMvodv4rOY23Y0BoGoBGgQ1zmU_MT_&t=2007
+
+        This is to construct a mathematical tool to measure how "far" a pair of tokens
+        are away from each other, aka *relative* position b/w a pair of token.
+
+        The idea is to use the observation that *inner product of two vector is invariant
+        to arbitrary rotation* to represent our desired characteristic that token embedding
+        should be invariant to absolute position.
+
+        d_k: dimension of query and key vectors, = d_embedding
+        (Note it seems we assume d_k to be a even number)
+
+        max_seq_len: Maximum sequence length. Used only for caching pre-computed rotation
+        angle values. Not necessarily = seq_len
+
+        spec:
+        i: token position index (in a token sequence). IMO i in [0, max_seq_len)
+            Q: Does this index start from 0 or 1? Assignment handout doesn't tell. But
+            per my experience in math notation indexing starting from 1 seems prevailing
+            A: Per UT, i starts from 0 (UT will barf if we use 1-based index)
+
+        R: Matrix that contain pair-wise rotation matrix R_i, where i in [0, max_seq_len)
+            R_i is of shape (d_k, d_k), so R is of shape (max_seq_len, d_k, d_k) to
+            account for ALL token positions in a token sequence.
+
+        The constructor logic is to compute and cache R.
+
+        If we did this in sequential manner:
+        For i in [0, max_seq_len):
+            Compute R_i.
+            For k in [1, d_k/2]:
+                Compute rotation angle theta_i_k
+                    theta_i_k = (i+1) / (theta^((2k-2)/d_k))
+                Compute cos and sin value at theta_i_k, form 2x2 matrix block R_i_k
+                Stack the block diagonally into R_i
+            R[i] = R_i
+
+        TODO: More pytorch-idiomatic, parallelizable impl
+        """
+        super().__init__()
+        assert d_k % 2 == 0, f"{d_k} is not even number"
+
+        def R_i_block(i: int, k: int) -> torch.Tensor:
+            theta_i_k = i / (theta ** ((2 * k - 2) / d_k))
+            cos_theta_i_k, sin_theta_i_k = cos(theta_i_k), sin(theta_i_k)
+            return torch.tensor(
+                [
+                    [cos_theta_i_k, -sin_theta_i_k],
+                    [sin_theta_i_k, cos_theta_i_k],
+                ],
+                device=device,
+            )
+
+        # R
+        self.register_buffer(
+            "rotation_matrix",
+            # == torch.stack(tensors, dim=0)
+            rearrange(
+                [
+                    # R_i
+                    torch.block_diag(*[R_i_block(i, k) for k in range(1, d_k // 2 + 1)])
+                    for i in range(0, max_seq_len)
+                ],
+                # stack all R_i together along the new (1st) dimension
+                "... -> ...",
+            ),
+            persistent=False,
+        )
+
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
+        """
+        x: tensor of shape (..., seq_len, d_k)
+        token_positions: a tensor of shape (..., seq_len) specifying the token
+            positions of x along the sequence dimension.
+        return: a tensor of the same shape as x.
+
+        Spec:
+        Identify the rotation matrices to use by given token position.
+            Do this w/ Pytorch's advanced indexing: R[token_positions] -> tensor of shape (..., seq_len, d_k, d_k)
+        Multiply a token's embedding vector of shape (d_k,) w/ the corresponding identified rotation matrix of shape (d_k, d_k)
+        """
+        rotation_matrix_by_pos: Float[Tensor, "... d_k d_k"] = self.rotation_matrix[
+            token_positions
+        ]
+        # note in einsum notation we cannot use duplicated
+        return einsum(
+            x,
+            rotation_matrix_by_pos,
+            # NOTE again in implementation we have to use row-major order,
+            # aka token_embedding_vector @ R_i.T Otherwise the result will
+            # be incorrect.
+            "... d_k_in, ... d_k_out d_k_in -> ... d_k_out",
         )

@@ -11,7 +11,13 @@ from torch import Tensor
 from pathlib import Path
 from cs336_basics.pretokenizer import pretokenize
 from cs336_basics.bpe import bpe_optimized, Tokenizer
-from cs336_basics.transformer import Linear, Embedding, RMSNorm, FFN
+from cs336_basics.transformer import (
+    Linear,
+    Embedding,
+    RMSNorm,
+    FFN,
+    RotaryPositionalEmbedding,
+)
 
 
 def run_linear(
@@ -91,11 +97,13 @@ def run_swiglu(
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
     m = FFN(d_model, d_ff)
-    m.load_state_dict({
-        'w1': w1_weight,
-        'w2': w2_weight,
-        'w3': w3_weight,
-    })
+    m.load_state_dict(
+        {
+            "w1": w1_weight,
+            "w2": w2_weight,
+            "w3": w3_weight,
+        }
+    )
     return m.forward(in_features)
 
 
@@ -213,7 +221,8 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+    m = RotaryPositionalEmbedding(theta, d_k, max_seq_len)
+    return m.forward(in_query_or_key, token_positions)
 
 
 def run_transformer_block(
@@ -392,7 +401,7 @@ def run_rmsnorm(
         RMSNorm of the `in_features`.
     """
     m = RMSNorm(d_model, eps)
-    m.load_state_dict({'gains': weights})
+    m.load_state_dict({"gains": weights})
     return m.forward(in_features)
 
 
