@@ -338,3 +338,27 @@ class RotaryPositionalEmbedding(nn.Module):
             # be incorrect.
             "... d_k_in, ... d_k_out d_k_in -> ... d_k_out",
         )
+
+
+def softmax(x: torch.Tensor, i: int) -> torch.Tensor:
+    """
+    x: Multi-dimensional tensor.
+    i: The i-th dimension of x (For now assume the index is 0-based)
+    return: Tensor of same shape as x, w/ values at i-th dimension turn into
+        normalized probabilities under softmax.
+
+    Can refer to the behavior of std pytorch lib softmax function.
+    """
+    assert (
+        -x.ndim <= i < x.ndim
+    ), f"Given dimension index {i} not found in tensor of {x.ndim} dimensions"
+    # Get the max values and corresponding indices on dimension i, plus keeping
+    # x's dimension around. This saves the extra move of creating a new
+    # dimensin in the resulting tensor (eg via tensor.unsqueeze(dim=i))
+    max_on_dim_i = x.max(dim=i, keepdim=True)
+    # softmax formula
+    # Subtract values on dimension i by the max values so that exp()
+    # of these values yields small values in (0, 1] for numerical stability
+    exp = torch.exp(x - max_on_dim_i.values)
+    exp_sum_on_dim_i = torch.sum(exp, dim=i, keepdim=True)
+    return exp / exp_sum_on_dim_i
