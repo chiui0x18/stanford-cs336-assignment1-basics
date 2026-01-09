@@ -238,7 +238,8 @@ class FFN(nn.Module):
 
 
 class RotaryPositionalEmbedding(nn.Module):
-    def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None) -> None:
+    def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None,
+                 dtype=torch.float32) -> None:
         """
         This module is used in transformer model component "Causal Multi-Head Self-Attention w/ RoPE"
         Its input is the output of pre-norm layer, in shape (batch_size, seq_len, d_embedding)
@@ -287,30 +288,30 @@ class RotaryPositionalEmbedding(nn.Module):
         super().__init__()
         assert d_k % 2 == 0, f"{d_k} is not even number"
 
-        def R_i_block(i: int, k: int) -> torch.Tensor:
-            theta_i_k = i / (theta ** ((2 * k - 2) / d_k))
-            cos_theta_i_k, sin_theta_i_k = cos(theta_i_k), sin(theta_i_k)
-            return torch.tensor(
-                [
-                    [cos_theta_i_k, -sin_theta_i_k],
-                    [sin_theta_i_k, cos_theta_i_k],
-                ],
-                device=device,
-            )
+        token_positions = torch.arange(max_seq_len, device=device, dtype=dtype)
+        # k in [1, 2, 3, ..., d/2] -> 2k-2 in [0, 2, 4, ..., d-2]
+        inv_theta_exps = theta ** (-torch.arange(start=0, end=d_k, step=2, device=device, dtype=dtype) / d_k)
+        # angle matrix of shape (max_seq_len, d_k/2)
+        angles = token_positions[:, None] * inv_theta_exps[None, :]
+        # sin and cos of angles (max_seq_len, d_k/2)
+        sin, cos = torch.sin(angles), torch.cos(angles)
+        # NOTE this will waste too much space for long sequence
+        R = torch.zeros(max_seq_len, d_k, d_k, dtype=dtype, device=device)
+        indices_on_diag = torch.arange(start=0, end=d_k, step=2, device=device)
+        # pytorch supports very handy and fancy indexing scheme; Below, ':'
+        # is to align on dimension 0 of R, whose size is max_seq_len, w/ cos
+        # and sin; Then individual item in indices_on_diag maps to item of
+        # the same position in cos / sin. E.g.:
+        # - 0 is the 1st value from indices_on_diag (at index 0), so assign cos[0, 0] to R[0, 0, 0], and cos[1, 0] to R[1, 0, 0], etc
+        # - 2 is the 2nd value from indices_on_diag (at index 1), so assign cos[0, 1] to R[0, 2, 2], and cos[1, 1] to R[1, 2, 2], etc
+        R[:, indices_on_diag, indices_on_diag] = cos
+        R[:, indices_on_diag+1, indices_on_diag] = sin
+        R[:, indices_on_diag, indices_on_diag+1] = -sin
+        R[:, indices_on_diag+1, indices_on_diag+1] = cos
 
-        # R
         self.register_buffer(
             "rotation_matrix",
-            # == torch.stack(tensors, dim=0)
-            rearrange(
-                [
-                    # R_i
-                    torch.block_diag(*[R_i_block(i, k) for k in range(1, d_k // 2 + 1)])
-                    for i in range(0, max_seq_len)
-                ],
-                # stack all R_i together along the new (1st) dimension
-                "... -> ...",
-            ),
+            R,
             persistent=False,
         )
 
