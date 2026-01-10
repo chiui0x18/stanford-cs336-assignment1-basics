@@ -17,6 +17,7 @@ from cs336_basics.transformer import (
     RMSNorm,
     FFN,
     RotaryPositionalEmbedding,
+    scaled_dot_product_attention,
     softmax,
 )
 
@@ -126,7 +127,7 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    return scaled_dot_product_attention(Q, K, V, mask)
 
 
 def run_multihead_self_attention(
@@ -457,6 +458,7 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         softmax normalizing the specified `dim`.
     """
     return softmax(in_features, i=dim)
+
 
 def run_cross_entropy(
     inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, " batch_size"]

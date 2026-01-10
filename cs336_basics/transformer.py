@@ -1,13 +1,12 @@
-from math import sin, cos
 import random
 import logging
 import torch
 from torch import Tensor
 import numpy as np
 import torch.nn as nn
-from einops import einsum, reduce, rearrange
+from einops import einsum, reduce, rearrange, repeat
 from cs336_basics.log import get_logger
-from jaxtyping import Float
+from jaxtyping import Float, Bool
 
 # https://docs.pytorch.org/docs/stable/notes/randomness.html
 # NOTE this has negative performance implications so be aware when using it in
@@ -238,8 +237,9 @@ class FFN(nn.Module):
 
 
 class RotaryPositionalEmbedding(nn.Module):
-    def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None,
-                 dtype=torch.float32) -> None:
+    def __init__(
+        self, theta: float, d_k: int, max_seq_len: int, device=None, dtype=torch.float32
+    ) -> None:
         """
         This module is used in transformer model component "Causal Multi-Head Self-Attention w/ RoPE"
         Its input is the output of pre-norm layer, in shape (batch_size, seq_len, d_embedding)
@@ -288,32 +288,18 @@ class RotaryPositionalEmbedding(nn.Module):
         super().__init__()
         assert d_k % 2 == 0, f"{d_k} is not even number"
 
-        token_positions = torch.arange(max_seq_len, device=device, dtype=dtype)
-        # k in [1, 2, 3, ..., d/2] -> 2k-2 in [0, 2, 4, ..., d-2]
-        inv_theta_exps = theta ** (-torch.arange(start=0, end=d_k, step=2, device=device, dtype=dtype) / d_k)
-        # angle matrix of shape (max_seq_len, d_k/2)
-        angles = token_positions[:, None] * inv_theta_exps[None, :]
-        # sin and cos of angles (max_seq_len, d_k/2)
-        sin, cos = torch.sin(angles), torch.cos(angles)
-        # NOTE this will waste too much space for long sequence
-        R = torch.zeros(max_seq_len, d_k, d_k, dtype=dtype, device=device)
-        indices_on_diag = torch.arange(start=0, end=d_k, step=2, device=device)
-        # pytorch supports very handy and fancy indexing scheme; Below, ':'
-        # is to align on dimension 0 of R, whose size is max_seq_len, w/ cos
-        # and sin; Then individual item in indices_on_diag maps to item of
-        # the same position in cos / sin. E.g.:
-        # - 0 is the 1st value from indices_on_diag (at index 0), so assign cos[0, 0] to R[0, 0, 0], and cos[1, 0] to R[1, 0, 0], etc
-        # - 2 is the 2nd value from indices_on_diag (at index 1), so assign cos[0, 1] to R[0, 2, 2], and cos[1, 1] to R[1, 2, 2], etc
-        R[:, indices_on_diag, indices_on_diag] = cos
-        R[:, indices_on_diag+1, indices_on_diag] = sin
-        R[:, indices_on_diag, indices_on_diag+1] = -sin
-        R[:, indices_on_diag+1, indices_on_diag+1] = cos
+        # (d_k/2,)
+        inv_freq = theta ** (-torch.arange(0, d_k, 2, device=device, dtype=dtype) / d_k)
 
-        self.register_buffer(
-            "rotation_matrix",
-            R,
-            persistent=False,
-        )
+        # (max_seq_len,)
+        positions = torch.arange(max_seq_len, device=device, dtype=dtype)
+
+        # (max_seq_len, d_k/2)
+        #freqs = torch.einsum("i,j->ij", positions, inv_freq)
+        freqs = einsum(positions, inv_freq, "i,j->i j")
+
+        self.register_buffer("cos", torch.cos(freqs), persistent=False)
+        self.register_buffer("sin", torch.sin(freqs), persistent=False)
 
     def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
         """
@@ -327,18 +313,37 @@ class RotaryPositionalEmbedding(nn.Module):
             Do this w/ Pytorch's advanced indexing: R[token_positions] -> tensor of shape (..., seq_len, d_k, d_k)
         Multiply a token's embedding vector of shape (d_k,) w/ the corresponding identified rotation matrix of shape (d_k, d_k)
         """
-        rotation_matrix_by_pos: Float[Tensor, "... d_k d_k"] = self.rotation_matrix[
-            token_positions
-        ]
-        # note in einsum notation we cannot use duplicated
-        return einsum(
-            x,
-            rotation_matrix_by_pos,
-            # NOTE again in implementation we have to use row-major order,
-            # aka token_embedding_vector @ R_i.T Otherwise the result will
-            # be incorrect.
-            "... d_k_in, ... d_k_out d_k_in -> ... d_k_out",
-        )
+        # (batch, seq, d_embed/2)
+        # print(f'token_positions shape: {token_positions.shape}')
+        cos_by_pos = self.cos[token_positions]
+        sin_by_pos = self.sin[token_positions]
+
+        # (batch, 1, seq, d_embed/2)
+        cos_by_pos = repeat(cos_by_pos, "... pos d -> ... 1 pos d")
+        sin_by_pos = repeat(sin_by_pos, "... pos d -> ... 1 pos d")
+        # print(f'cos_by_pos shape: {cos_by_pos.shape}')
+
+        # rearrange x so that the last dimension is pair of embedding vector
+        # component to be rotated
+        # x now of shape (batch, seq, d_embed/2, 2)
+        x = rearrange(x, "... (d p) -> ... d p", p=2)
+        ##print(f'x shape: {x.shape}')
+        # tensors below are of shape (batch, seq, d_embed/2)
+        x_even_idx, x_odd_idx = x[..., 0], x[..., 1]
+        # 2d rotation
+        x_rot_even = x_even_idx * cos_by_pos - x_odd_idx * sin_by_pos
+        x_rot_odd = x_even_idx * sin_by_pos + x_odd_idx * cos_by_pos
+        # print(f'x_rot_even shape: {x_rot_even.shape}')
+
+        # Re-assemble rotated pair of embedding vector elements into the whole
+        # vector
+        # return rearrange(
+        #        torch.stack((x_rot_even, x_rot_odd), dim=-1),
+        #        '... d p -> ... (d p)',
+        # )
+        # final = rearrange([x_rot_even, x_rot_odd], 'new ... d -> ... (d new)')
+        # print(f'final result shape: {final.shape}')
+        return rearrange([x_rot_even, x_rot_odd], "new ... d -> ... (d new)")
 
 
 def softmax(x: torch.Tensor, i: int) -> torch.Tensor:
@@ -363,3 +368,39 @@ def softmax(x: torch.Tensor, i: int) -> torch.Tensor:
     exp = torch.exp(x - max_on_dim_i.values)
     exp_sum_on_dim_i = torch.sum(exp, dim=i, keepdim=True)
     return exp / exp_sum_on_dim_i
+
+
+def scaled_dot_product_attention(
+    Q: Float[Tensor, "... queries d_k"],
+    K: Float[Tensor, "... keys d_k"],
+    V: Float[Tensor, "... values d_v"],
+    mask: Bool[Tensor, "... queries keys"] | None = None,
+) -> Float[Tensor, "... queries d_v"]:
+    """
+    Your implementation should handle keys and queries of shape
+    (batch_size, ..., seq_len, d_k) and values of shape
+    (batch_size, ..., seq_len, d_v), where ... represents any
+    number of other batch-like dimensions (if provided).
+    The implementation should return an output with the
+    shape (batch_size, ..., d_v).
+    """
+    d_k = K.shape[-1]
+    # (... queries keys)
+    # presoftmax = Q @ K.transpose(-1, -2) / (d_k ** 0.5)
+    presoftmax = einsum(Q, K, "... queries d_k, ... keys d_k -> ... queries keys") / (
+        d_k**0.5
+    )
+    if mask is not None:
+        # mask tensor serves as an index; Below `~` negates the value of mask
+        # (aka True -> False and False -> True). For a slot w/ index (... q, k),
+        # if the value at that index in mask tensor is False, then we assign
+        # -inf to the slot w/ the same index in tensor `presoftmax`, so that
+        # after exp its value becomes 0. torch.exp([-inf]) = 0
+        presoftmax[~mask] = -float("inf")
+
+    # apply softmax to the very last dimension
+    softmaxed = softmax(presoftmax, i=-1)
+    # return softmaxed @ V
+    return einsum(
+        softmaxed, V, "... queries seq_len, ... seq_len d_v -> ... queries d_v"
+    )
