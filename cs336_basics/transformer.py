@@ -6,7 +6,7 @@ import numpy as np
 import torch.nn as nn
 from einops import einsum, reduce, rearrange, repeat
 from cs336_basics.log import get_logger
-from jaxtyping import Float, Bool
+from jaxtyping import Float, Bool, Int
 
 # https://docs.pytorch.org/docs/stable/notes/randomness.html
 # NOTE this has negative performance implications so be aware when using it in
@@ -286,7 +286,7 @@ class RotaryPositionalEmbedding(nn.Module):
         TODO: More pytorch-idiomatic, parallelizable impl
         """
         super().__init__()
-        assert d_k % 2 == 0, f"{d_k} is not even number"
+        assert d_k % 2 == 0, f"Embedding vector dimension size {d_k} is not even number"
 
         # (d_k/2,)
         inv_freq = theta ** (-torch.arange(0, d_k, 2, device=device, dtype=dtype) / d_k)
@@ -295,7 +295,7 @@ class RotaryPositionalEmbedding(nn.Module):
         positions = torch.arange(max_seq_len, device=device, dtype=dtype)
 
         # (max_seq_len, d_k/2)
-        #freqs = torch.einsum("i,j->ij", positions, inv_freq)
+        # freqs = torch.einsum("i,j->ij", positions, inv_freq)
         freqs = einsum(positions, inv_freq, "i,j->i j")
 
         self.register_buffer("cos", torch.cos(freqs), persistent=False)
@@ -377,6 +377,8 @@ def scaled_dot_product_attention(
     mask: Bool[Tensor, "... queries keys"] | None = None,
 ) -> Float[Tensor, "... queries d_v"]:
     """
+    TODO: doc on input and output.
+
     Your implementation should handle keys and queries of shape
     (batch_size, ..., seq_len, d_k) and values of shape
     (batch_size, ..., seq_len, d_v), where ... represents any
@@ -396,7 +398,7 @@ def scaled_dot_product_attention(
         # if the value at that index in mask tensor is False, then we assign
         # -inf to the slot w/ the same index in tensor `presoftmax`, so that
         # after exp its value becomes 0. torch.exp([-inf]) = 0
-        presoftmax[~mask] = -float("inf")
+        presoftmax[..., ~mask] = -float("inf")
 
     # apply softmax to the very last dimension
     softmaxed = softmax(presoftmax, i=-1)
@@ -404,3 +406,158 @@ def scaled_dot_product_attention(
     return einsum(
         softmaxed, V, "... queries seq_len, ... seq_len d_v -> ... queries d_v"
     )
+
+
+class MultiheadSelfAttention(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        theta: float | None = None,
+        max_seq_len: int | None = None,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        """
+        d_model: Dimensionality of the Transformer block inputs.
+            == embedding vector dimension size d_embedding.
+        num_heads: Number of heads to use in multi-head self-attention.
+        theta, max_seq_len: Parameters for initializing RoPE layer.
+
+        Folllowing Vaswani et al. [2017], set d_k = d_v = d_model / h.
+
+        TODO:
+        - Any initialization for causal masking?
+
+        """
+        super().__init__()
+        # Initialize following linear weights per assignment section 3.4.1
+        # W_Q, W_K, W_V all in shape (d_model (=h x d_k or h x d_v), d_model)
+        # W_O in shape (d_model, d_model (=h x d_v))
+        std = d_model**-0.5
+        self.W_Q = nn.Parameter(
+            nn.init.trunc_normal_(
+                torch.empty(d_model, d_model, device=device, dtype=dtype),
+                mean=0,
+                std=std,
+                a=-3 * std,
+                b=3 * std,
+            )
+        )
+        self.W_K = nn.Parameter(
+            nn.init.trunc_normal_(
+                torch.empty(d_model, d_model, device=device, dtype=dtype),
+                mean=0,
+                std=std,
+                a=-3 * std,
+                b=3 * std,
+            )
+        )
+        self.W_V = nn.Parameter(
+            nn.init.trunc_normal_(
+                torch.empty(d_model, d_model, device=device, dtype=dtype),
+                mean=0,
+                std=std,
+                a=-3 * std,
+                b=3 * std,
+            )
+        )
+        self.W_O = nn.Parameter(
+            nn.init.trunc_normal_(
+                torch.empty(d_model, d_model, device=device, dtype=dtype),
+                mean=0,
+                std=std,
+                a=-3 * std,
+                b=3 * std,
+            )
+        )
+        self.num_heads = num_heads
+        if theta is not None and max_seq_len is not None:
+            self.rope = RotaryPositionalEmbedding(
+                theta, d_k=d_model, max_seq_len=max_seq_len, device=device, dtype=dtype
+            )
+
+    def forward(
+        self,
+        x: Float[Tensor, "... seq_len d_model"],
+        token_positions: Int[Tensor, "... seq_len"] | None = None,
+    ) -> torch.Tensor:
+        """
+        Spec:
+        (NOTE we use impl notation below instead of math notation appeared in assignment handout)
+
+        Build the attention logic bottom-up, w/ naive approach first.
+            The smallest logic unit is Attention(Q_i, K_i, V_i), where i in [0, num_heads)
+            Q_i = x @ (the i-th out of h slices of W_Q.T). The shape of W_Q.T is (d_model, h x d_k)
+
+            Similar paradigm applies to K_i and V_i. Reading the original transformer paper I believe
+            the dimension on which slicing applies is the dimension of embedding vector.
+
+            (Slicing this way makes sense, cuz suppose we sliced on the dimension of token sequence,
+            then when processing a token in a particular slice, how can the model attend to tokens
+            which run *before* this token? No way, cuz embeddings of such predecessor tokens likely
+            would have been in different slices -- a contradiction and dead end)
+
+        Dimension along which concatenation of head_1, head_2, ... head_h is the last dim
+            and the size of resulting dimension is d_model
+
+        IMO we only need to slice right before calling scaled_dot_product_attention fn.
+        Ensure correctness first before jumping to optimization.
+
+        TODO: For efficient tensor ops, we can lump W_Q, W_K, W_V into a single large tensor instead of separating them.
+        """
+        # Reshape tensors so that on the last dimension resides per-head values subject to application of attention.
+        # This way we avoid the hassle and inefficiency of for i in num_heads do Attention(Q_i, K_i, V_i) :D
+        # Note d_head x d_embedding_per_head = d_embedding (aka d_model)
+        Q_all_h = rearrange(
+            x @ self.W_Q.T,
+            "... d_seq (d_head d_embedding_per_head) -> ... d_head d_seq d_embedding_per_head",
+            d_head=self.num_heads,
+        )
+        K_all_h = rearrange(
+            x @ self.W_K.T,
+            "... d_seq (d_head d_embedding_per_head) -> ... d_head d_seq d_embedding_per_head",
+            d_head=self.num_heads,
+        )
+        # Apply RoPE to query and key before applying attention
+        # Apply RoPE if all prerequisites present
+        if hasattr(self, "rope") and token_positions is not None:
+            Q_all_h = self.rope.forward(Q_all_h, token_positions)
+            K_all_h = self.rope.forward(K_all_h, token_positions)
+        V_all_h = rearrange(
+            x @ self.W_V.T,
+            "... d_seq (d_head d_embedding_per_head) -> ... d_head d_seq d_embedding_per_head",
+            d_head=self.num_heads,
+        )
+        # Tensor for causal masking
+        # We shall directly use the existing masking logic in scaled_dot_product_attention; The problem is now reduced to creation of a mask tensor.
+        # By definition, the mask should apply along the dimension of token sequence.
+        # Prompting ChatGPT about the meaning of Q and K matrix, whose result of matmul over dimension (d_embedding_per_head)
+        # (shape involved: (d_q x d_embedding_per_head) @ (d_embedding_per_head x d_k)) is
+        # the input of masking in scaled dot product attention function, ChatGPT's response
+        # claims that a row in Q, corresponding to a token in sequence, represents the "questions" / "queries"
+        # which this particular token ask / attend to all other tokens in the sequence. HOWEVER,
+        # I believe such interpretation should apply to the matmul result above instead; Let's say
+        # the matmul result is QK (of shape (... d_q d_k)), focus on the 2-d matrix of shape (d_q d_k),
+        # then the row at index i of this matrix, whose size is d_k, represents the "questions" / "queries"
+        # of token i in the sequence to all other tokens in the same sequence. Item at index j of this
+        # row represents the query of token i to token j in the same sequence. Meanwhile, column at index i
+        # of this matrix represents the info which token at index i of sequence provides to all other tokens
+        # in the same sequence. See https://chatgpt.com/s/t_6964464a2ff48191a4208206c18b4f06
+        # In this light, we should create the mask so that the i-th token only
+        # query all its predecessor, resulting in mask matrix whose elements of lower triangular part
+        # are True while others are False
+        # Note the dimension required here is the sequence length dimension which is not available in module init time :(
+        d_seq_size = x.shape[-2]
+        mask = torch.tril(
+            torch.ones(d_seq_size, d_seq_size, device=x.device, dtype=torch.bool)
+        )
+        attended_all_h: Float[Tensor, "... d_head d_seq d_embedding_per_head"] = (
+            scaled_dot_product_attention(Q_all_h, K_all_h, V_all_h, mask)
+        )
+        # Concatenate to restore the dimension of embedding vector, so that it is ready for linear transformation w/ W_O
+        attended_all_h = rearrange(
+            attended_all_h,
+            "... d_head d_seq d_embedding_per_head -> ... d_seq (d_head d_embedding_per_head)",
+        )
+        return attended_all_h @ self.W_O.T

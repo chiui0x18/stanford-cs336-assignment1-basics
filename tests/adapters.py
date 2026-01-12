@@ -4,6 +4,7 @@ import os
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 
+from einops import repeat
 import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
@@ -19,6 +20,7 @@ from cs336_basics.transformer import (
     RotaryPositionalEmbedding,
     scaled_dot_product_attention,
     softmax,
+    MultiheadSelfAttention,
 )
 
 
@@ -127,6 +129,7 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
+    print(f"Q shape = {Q.shape} K shape = {K.shape} mask shape = {mask.shape}")
     return scaled_dot_product_attention(Q, K, V, mask)
 
 
@@ -160,8 +163,20 @@ def run_multihead_self_attention(
     Returns:
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
+
+    Need to repeat the given Q, K, V, and O so that they meet the dimension
+    requirement of module.
     """
-    raise NotImplementedError
+    m = MultiheadSelfAttention(d_model, num_heads)
+    m.load_state_dict(
+        {
+            "W_Q": q_proj_weight,
+            "W_K": k_proj_weight,
+            "W_V": v_proj_weight,
+            "W_O": o_proj_weight,
+        }
+    )
+    return m.forward(in_features)
 
 
 def run_multihead_self_attention_with_rope(
@@ -201,7 +216,16 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    m = MultiheadSelfAttention(d_model, num_heads, theta=theta, max_seq_len=max_seq_len)
+    m.load_state_dict(
+        {
+            "W_Q": q_proj_weight,
+            "W_K": k_proj_weight,
+            "W_V": v_proj_weight,
+            "W_O": o_proj_weight,
+        }
+    )
+    return m.forward(in_features, token_positions=token_positions)
 
 
 def run_rope(
