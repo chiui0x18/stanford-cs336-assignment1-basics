@@ -49,7 +49,6 @@ class Linear(nn.Module):
                 b=3 * std,
             )
         )
-        print(self.w.device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # In vanilla torch:
@@ -314,9 +313,10 @@ class RotaryPositionalEmbedding(nn.Module):
         Multiply a token's embedding vector of shape (d_k,) w/ the corresponding identified rotation matrix of shape (d_k, d_k)
         """
         # (batch, seq, d_embed/2)
-        # print(f'token_positions shape: {token_positions.shape}')
+        # print(f'x shape: {x.shape} token_positions shape: {token_positions.shape}')
         cos_by_pos = self.cos[token_positions]
         sin_by_pos = self.sin[token_positions]
+        # print(f'cos_by_pos shape before repeating: {cos_by_pos.shape}')
 
         # (batch, 1, seq, d_embed/2)
         cos_by_pos = repeat(cos_by_pos, "... pos d -> ... 1 pos d")
@@ -327,10 +327,11 @@ class RotaryPositionalEmbedding(nn.Module):
         # component to be rotated
         # x now of shape (batch, seq, d_embed/2, 2)
         x = rearrange(x, "... (d p) -> ... d p", p=2)
-        ##print(f'x shape: {x.shape}')
+        # print(f'x shape: {x.shape}')
         # tensors below are of shape (batch, seq, d_embed/2)
         x_even_idx, x_odd_idx = x[..., 0], x[..., 1]
         # 2d rotation
+        # print(f'x_even_idx shape: {x_even_idx.shape} cos_by_pos shape: {cos_by_pos.shape}')
         x_rot_even = x_even_idx * cos_by_pos - x_odd_idx * sin_by_pos
         x_rot_odd = x_even_idx * sin_by_pos + x_odd_idx * cos_by_pos
         # print(f'x_rot_even shape: {x_rot_even.shape}')
@@ -473,8 +474,14 @@ class MultiheadSelfAttention(nn.Module):
         )
         self.num_heads = num_heads
         if theta is not None and max_seq_len is not None:
+            # For why d_k is set to size of per-head embedding dimension, see
+            # the dimension of input of RoPE in forward() below
             self.rope = RotaryPositionalEmbedding(
-                theta, d_k=d_model, max_seq_len=max_seq_len, device=device, dtype=dtype
+                theta,
+                d_k=d_model // num_heads,
+                max_seq_len=max_seq_len,
+                device=device,
+                dtype=dtype,
             )
 
     def forward(
@@ -498,8 +505,8 @@ class MultiheadSelfAttention(nn.Module):
             which run *before* this token? No way, cuz embeddings of such predecessor tokens likely
             would have been in different slices -- a contradiction and dead end)
 
-        Dimension along which concatenation of head_1, head_2, ... head_h is the last dim
-            and the size of resulting dimension is d_model
+        Dimension along which concatenation of head_1, head_2, ... head_h is the last dim, the dimension
+            of embedding vector. And the size of resulting dimension is d_model
 
         IMO we only need to slice right before calling scaled_dot_product_attention fn.
         Ensure correctness first before jumping to optimization.
@@ -522,8 +529,8 @@ class MultiheadSelfAttention(nn.Module):
         # Apply RoPE to query and key before applying attention
         # Apply RoPE if all prerequisites present
         if hasattr(self, "rope") and token_positions is not None:
-            Q_all_h = self.rope.forward(Q_all_h, token_positions)
-            K_all_h = self.rope.forward(K_all_h, token_positions)
+            Q_all_h = self.rope(Q_all_h, token_positions)
+            K_all_h = self.rope(K_all_h, token_positions)
         V_all_h = rearrange(
             x @ self.W_V.T,
             "... d_seq (d_head d_embedding_per_head) -> ... d_head d_seq d_embedding_per_head",
