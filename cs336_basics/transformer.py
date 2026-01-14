@@ -70,7 +70,7 @@ class Embedding(nn.Module):
     ) -> None:
         """
         num_embeddings: Vocabulary size
-        embedding_dim: Dimension of the embedding vectors
+        embedding_dim: Dimension of the embedding vectors. == d_model mentioned below
         device: Device to store model parameters on
         dtype: Model parameter datatype
 
@@ -426,10 +426,6 @@ class MultiheadSelfAttention(nn.Module):
         theta, max_seq_len: Parameters for initializing RoPE layer.
 
         Folllowing Vaswani et al. [2017], set d_k = d_v = d_model / h.
-
-        TODO:
-        - Any initialization for causal masking?
-
         """
         super().__init__()
         # Initialize following linear weights per assignment section 3.4.1
@@ -537,7 +533,8 @@ class MultiheadSelfAttention(nn.Module):
             d_head=self.num_heads,
         )
         # Tensor for causal masking
-        # We shall directly use the existing masking logic in scaled_dot_product_attention; The problem is now reduced to creation of a mask tensor.
+        # We shall directly use the existing masking logic in scaled_dot_product_attention;
+        # The problem is now reduced to creation of a mask tensor.
         # By definition, the mask should apply along the dimension of token sequence.
         # Prompting ChatGPT about the meaning of Q and K matrix, whose result of matmul over dimension (d_embedding_per_head)
         # (shape involved: (d_q x d_embedding_per_head) @ (d_embedding_per_head x d_k)) is
@@ -568,3 +565,128 @@ class MultiheadSelfAttention(nn.Module):
             "... d_head d_seq d_embedding_per_head -> ... d_seq (d_head d_embedding_per_head)",
         )
         return attended_all_h @ self.W_O.T
+
+
+class TransformerBlock(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        theta: float | None = None,
+        max_seq_len: int | None = None,
+        eps: float = 1e-5,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__()
+        self.norm_pre_multihead_attention = RMSNorm(d_model, eps, device, dtype)
+        self.multihead_attention = MultiheadSelfAttention(
+            d_model, num_heads, theta, max_seq_len, device, dtype
+        )
+        self.norm_pre_ffn = RMSNorm(d_model, eps, device, dtype)
+        self.ffn = FFN(d_model, d_ff, device, dtype)
+
+    def forward(
+        self,
+        x: Float[Tensor, "batch seq_len d_model"],
+        token_positions: Int[Tensor, "... seq_len"] | None = None,
+    ) -> Float[Tensor, "batch seq_len d_model"]:
+        """
+        token_positions: Tensor holding token's position index in sequence. Can be a
+        simple 1-D tensor (eg [0, 1, 2, 3, ...]) or a batched tensor.
+        """
+        # 1st sublayer
+        x += self.multihead_attention(
+            self.norm_pre_multihead_attention(x), token_positions
+        )
+        # 2nd sublayer
+        return x + self.ffn(self.norm_pre_ffn(x))
+
+
+class TransformerModel(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        context_len: int,
+        num_layers: int,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        rope_theta: float | None = None,
+        eps: float = 1e-5,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        """
+        vocab_size: The size of the (token/sequence item) vocabulary for
+            determining dimension of token embedding matrix.
+        context_length: The maximum context length, necessary for determining
+            the dimensionality of the position embedding matrix.
+        num_layers: Number of Transformer blocks to apply.
+        d_model: Size of embedding vector dimension hidden in the Transformer model.
+            Aka, the dimensionality of the model embeddings and sublayer outputs.
+        """
+        super().__init__()
+        # layer's input and output dim: (batch, seq_len) -> (batch, seq_len, d_model)
+        self.token_embedding = Embedding(
+            num_embeddings=vocab_size, embedding_dim=d_model, device=device, dtype=dtype
+        )
+        # (batch, seq_len, d_model) -> (batch, seq_len, d_model)
+        self.transformer_blocks = nn.ModuleList(
+            [
+                TransformerBlock(
+                    d_model,
+                    num_heads,
+                    d_ff,
+                    theta=rope_theta,
+                    max_seq_len=context_len,
+                    eps=eps,
+                    device=device,
+                    dtype=dtype,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        # (batch, seq_len, d_model) -> (batch, seq_len, d_model)
+        self.norm_post_transformer_blocks = RMSNorm(
+            d_model, eps, device=device, dtype=dtype
+        )
+        # (batch, seq_len, d_model) -> (batch, seq_len, vocab_size)
+        self.output_embedding = Linear(
+            in_features=d_model, out_features=vocab_size, device=device, dtype=dtype
+        )
+
+    def forward(
+        self,
+        x: Int[Tensor, "batch_size seq_len"],
+        normalize_output: bool | None = True,
+    ) -> Float[Tensor, "batch_size seq_len vocab_size"]:
+        """
+        x: Batch of token ID sequences, of shape (batch_size, seq_len)
+        normalize_output: Normalize transformer model output w/ softmax.
+            Default to true. Add this flag as UT demands unnormalized output,
+            which IMO is to avoid issue in comparison of super small numbers
+            which is deemed to be inaccurate due to the use of representation
+            w/ limited bitwidth.
+        return: Batched normalized probability distribution over given token
+            vocabulary, of shape (batch_size, seq_len, vocab_size), where the
+            predicted distribution is over the next word for each input token.
+            Specifically, the value at index [i, j, k] of this resultant tensor
+            represents the probability that the next token of the j-th token
+            in the i-th sequence of the given batch (aka x) is token w/ ID k.
+            (i, j, k are all 0-based)
+
+        For more see assignment handout section 3, page 14.
+        """
+        _, seq_len = x.shape
+        # Tensor holding tokens position indices in sequence
+        token_positions = torch.arange(0, seq_len, device=x.device, dtype=torch.int)
+        x = self.token_embedding(x)
+        for t in self.transformer_blocks:
+            x = t(x, token_positions)
+        x = self.norm_post_transformer_blocks(x)
+        if normalize_output:
+            return softmax(self.output_embedding(x), i=-1)
+        else:
+            return self.output_embedding(x)

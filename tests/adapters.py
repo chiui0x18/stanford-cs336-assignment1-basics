@@ -21,6 +21,8 @@ from cs336_basics.transformer import (
     scaled_dot_product_attention,
     softmax,
     MultiheadSelfAttention,
+    TransformerBlock,
+    TransformerModel,
 )
 
 
@@ -321,7 +323,36 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    m = TransformerBlock(
+        d_model=d_model,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        theta=theta,
+        max_seq_len=max_seq_len,
+    )
+    m.norm_pre_multihead_attention.load_state_dict({"gains": weights["ln1.weight"]})
+    m.multihead_attention.load_state_dict(
+        {
+            "W_Q": weights["attn.q_proj.weight"],
+            "W_K": weights["attn.k_proj.weight"],
+            "W_V": weights["attn.v_proj.weight"],
+            "W_O": weights["attn.output_proj.weight"],
+        }
+    )
+    m.norm_pre_ffn.load_state_dict({"gains": weights["ln2.weight"]})
+    m.ffn.load_state_dict(
+        {
+            "w1": weights["ffn.w1.weight"],
+            "w2": weights["ffn.w2.weight"],
+            "w3": weights["ffn.w3.weight"],
+        }
+    )
+    batch, seq_len, _ = in_features.shape
+    # NOTE we generate the token positions tensor ourselves; We don't even need
+    # to batch the token position values normally. Specifying tokens' natural
+    # positions in sequence suffice.
+    # token_positions = repeat(torch.arange(0, seq_len), 'seq_len -> b seq_len', b=batch)
+    return m(in_features, torch.arange(0, seq_len))  # == m.forward(in, pos)
 
 
 def run_transformer_lm(
@@ -403,7 +434,47 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    m = TransformerModel(
+        vocab_size=vocab_size,
+        context_len=context_length,
+        num_layers=num_layers,
+        d_model=d_model,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        rope_theta=rope_theta,
+    )
+    m.token_embedding.load_state_dict(
+        {"token_to_embedding_vector": weights["token_embeddings.weight"]}
+    )
+    for layer_idx in range(num_layers):
+        key_prefix = f"layers.{layer_idx}"
+        block = m.transformer_blocks[layer_idx]
+        block.norm_pre_multihead_attention.load_state_dict(
+            {"gains": weights[f"{key_prefix}.ln1.weight"]}
+        )
+        block.multihead_attention.load_state_dict(
+            {
+                "W_Q": weights[f"{key_prefix}.attn.q_proj.weight"],
+                "W_K": weights[f"{key_prefix}.attn.k_proj.weight"],
+                "W_V": weights[f"{key_prefix}.attn.v_proj.weight"],
+                "W_O": weights[f"{key_prefix}.attn.output_proj.weight"],
+            }
+        )
+        block.norm_pre_ffn.load_state_dict(
+            {"gains": weights[f"{key_prefix}.ln2.weight"]}
+        )
+        block.ffn.load_state_dict(
+            {
+                "w1": weights[f"{key_prefix}.ffn.w1.weight"],
+                "w2": weights[f"{key_prefix}.ffn.w2.weight"],
+                "w3": weights[f"{key_prefix}.ffn.w3.weight"],
+            }
+        )
+    m.norm_post_transformer_blocks.load_state_dict(
+        {"gains": weights["ln_final.weight"]}
+    )
+    m.output_embedding.load_state_dict({"w": weights["lm_head.weight"]})
+    return m(in_indices, normalize_output=False)
 
 
 def run_rmsnorm(
