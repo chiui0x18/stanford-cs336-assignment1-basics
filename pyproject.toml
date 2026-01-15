@@ -4,6 +4,9 @@ version = "1.0.6"
 description = "CS336 Assignment 1"
 readme = "README.md"
 requires-python = ">=3.11"
+# use `uv add <dep1> <dep2>` to manage dependencies used in project.
+# More see https://docs.astral.sh/uv/concepts/projects/layout/#the-project-environment
+# Also remember to check file uv.lock into version control
 dependencies = [
     "einops>=0.8.1", # tensor operations
     "einx>=0.3.0", # more general tensor operations
@@ -19,10 +22,10 @@ dependencies = [
     "tqdm>=4.67.1",
     "wandb>=0.19.7",
     "ty>=0.0.1a16",
-    "ruff",
-    "black",
-    "snakeviz",
-    "jupyterlab"
+    "ruff>=0.14.10",
+    "black>=25.12.0",
+    "snakeviz>=2.2.2",
+    "jupyterlab>=4.5.1",
 ]
 
 [build-system]
