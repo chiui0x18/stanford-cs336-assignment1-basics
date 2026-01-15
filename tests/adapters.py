@@ -172,9 +172,7 @@ def run_multihead_self_attention(
     m = MultiheadSelfAttention(d_model, num_heads)
     m.load_state_dict(
         {
-            "W_Q": q_proj_weight,
-            "W_K": k_proj_weight,
-            "W_V": v_proj_weight,
+            "W_QKV": torch.stack([q_proj_weight, k_proj_weight, v_proj_weight], dim=0),
             "W_O": o_proj_weight,
         }
     )
@@ -221,9 +219,7 @@ def run_multihead_self_attention_with_rope(
     m = MultiheadSelfAttention(d_model, num_heads, theta=theta, max_seq_len=max_seq_len)
     m.load_state_dict(
         {
-            "W_Q": q_proj_weight,
-            "W_K": k_proj_weight,
-            "W_V": v_proj_weight,
+            "W_QKV": torch.stack([q_proj_weight, k_proj_weight, v_proj_weight], dim=0),
             "W_O": o_proj_weight,
         }
     )

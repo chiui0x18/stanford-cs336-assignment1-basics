@@ -426,33 +426,21 @@ class MultiheadSelfAttention(nn.Module):
         theta, max_seq_len: Parameters for initializing RoPE layer.
 
         Folllowing Vaswani et al. [2017], set d_k = d_v = d_model / h.
+
+        For compute efficiency, we lump W_Q, W_K, W_V into a single large
+        matrix instead of separating them, to reduce # matmuls to perform.
         """
         super().__init__()
         # Initialize following linear weights per assignment section 3.4.1
         # W_Q, W_K, W_V all in shape (d_model (=h x d_k or h x d_v), d_model)
         # W_O in shape (d_model, d_model (=h x d_v))
         std = d_model**-0.5
-        self.W_Q = nn.Parameter(
+        # Stretch goal: Combine weights for Q, K, V into a single matrix to
+        # reduce # matmuls. Implement W_QKV so that Q, K, V = W_QKV[0], W_QKV[1], W_QKV[2]
+        # W_QKV of shape (3, d_model, d_model)
+        self.W_QKV = nn.Parameter(
             nn.init.trunc_normal_(
-                torch.empty(d_model, d_model, device=device, dtype=dtype),
-                mean=0,
-                std=std,
-                a=-3 * std,
-                b=3 * std,
-            )
-        )
-        self.W_K = nn.Parameter(
-            nn.init.trunc_normal_(
-                torch.empty(d_model, d_model, device=device, dtype=dtype),
-                mean=0,
-                std=std,
-                a=-3 * std,
-                b=3 * std,
-            )
-        )
-        self.W_V = nn.Parameter(
-            nn.init.trunc_normal_(
-                torch.empty(d_model, d_model, device=device, dtype=dtype),
+                torch.empty(3, d_model, d_model, device=device, dtype=dtype),
                 mean=0,
                 std=std,
                 a=-3 * std,
@@ -506,32 +494,35 @@ class MultiheadSelfAttention(nn.Module):
 
         IMO we only need to slice right before calling scaled_dot_product_attention fn.
         Ensure correctness first before jumping to optimization.
-
-        TODO: For efficient tensor ops, we can lump W_Q, W_K, W_V into a single large tensor instead of separating them.
         """
         # Reshape tensors so that on the last dimension resides per-head values subject to application of attention.
         # This way we avoid the hassle and inefficiency of for i in num_heads do Attention(Q_i, K_i, V_i) :D
         # Note d_head x d_embedding_per_head = d_embedding (aka d_model)
-        Q_all_h = rearrange(
-            x @ self.W_Q.T,
-            "... d_seq (d_head d_embedding_per_head) -> ... d_head d_seq d_embedding_per_head",
-            d_head=self.num_heads,
-        )
-        K_all_h = rearrange(
-            x @ self.W_K.T,
+        # QKV_all_h of shape (... 3, d_head, d_seq, d_embeddding_per_head)
+        XQKV_all_h = rearrange(
+            # x @ Q.T, x @ K.T, x @ V.T in one go
+            # d_to_split_by_head == (d_k or d_v x h) == d_model
+            # `kind`: index subscript to select tensor for Q, k or V
+            einsum(
+                x,
+                self.W_QKV,
+                "... d_seq d_model, kind d_to_split_by_head d_model -> ... kind d_seq d_to_split_by_head",
+            ),
             "... d_seq (d_head d_embedding_per_head) -> ... d_head d_seq d_embedding_per_head",
             d_head=self.num_heads,
         )
         # Apply RoPE to query and key before applying attention
         # Apply RoPE if all prerequisites present
         if hasattr(self, "rope") and token_positions is not None:
-            Q_all_h = self.rope(Q_all_h, token_positions)
-            K_all_h = self.rope(K_all_h, token_positions)
-        V_all_h = rearrange(
-            x @ self.W_V.T,
-            "... d_seq (d_head d_embedding_per_head) -> ... d_head d_seq d_embedding_per_head",
-            d_head=self.num_heads,
-        )
+            # The 1st `:` means selecting all batches (all indices along the
+            # batch dimension), the 2nd `:2` means selecting tensor for Q and K
+            # More see https://numpy.org/doc/stable/user/basics.indexing.html#basic-indexing
+            # XQKV_all_h[:, :2] = self.rope(XQKV_all_h[:, :2], token_positions)
+            # Equivalent to above, by slicing and selecting along the `kind`
+            # dimension. This way can handle arbitrary prefixing dimensions in x
+            XQKV_all_h[..., :2, :, :, :] = self.rope(
+                XQKV_all_h[..., :2, :, :, :], token_positions
+            )
         # Tensor for causal masking
         # We shall directly use the existing masking logic in scaled_dot_product_attention;
         # The problem is now reduced to creation of a mask tensor.
@@ -557,7 +548,12 @@ class MultiheadSelfAttention(nn.Module):
             torch.ones(d_seq_size, d_seq_size, device=x.device, dtype=torch.bool)
         )
         attended_all_h: Float[Tensor, "... d_head d_seq d_embedding_per_head"] = (
-            scaled_dot_product_attention(Q_all_h, K_all_h, V_all_h, mask)
+            scaled_dot_product_attention(
+                XQKV_all_h[..., 0, :, :, :],  # XQ
+                XQKV_all_h[..., 1, :, :, :],  # XK
+                XQKV_all_h[..., 2, :, :, :],  # XV
+                mask,
+            )
         )
         # Concatenate to restore the dimension of embedding vector, so that it is ready for linear transformation w/ W_O
         attended_all_h = rearrange(
