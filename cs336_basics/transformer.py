@@ -1,3 +1,5 @@
+from collections import namedtuple
+from math import prod
 import random
 import logging
 import torch
@@ -50,7 +52,7 @@ class Linear(nn.Module):
             )
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: Float[Tensor, "... d_in"]) -> Float[Tensor, "... d_out"]:
         # In vanilla torch:
         # return x @ self.w.T
         # Prefer Einstein notation as it clearly and concisely declares the op's purpose
@@ -91,7 +93,9 @@ class Embedding(nn.Module):
             )
         )
 
-    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, token_ids: Int[Tensor, "batch seq_len"]
+    ) -> Float[Tensor, "batch seq_len d_model"]:
         """
         token_ids: A tensor of long type of shape (batch, seq_len)
         return: A tensor of token embeddings of shape (batch, seq_len, embedding_dim)
@@ -150,7 +154,9 @@ class RMSNorm(nn.Module):
         self.gains = nn.Parameter(torch.ones(d_model, dtype=dtype, device=device))
         self.eps = eps
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "batch_size seq_len d_model"]
+    ) -> Float[Tensor, "batch_size seq_len d_model"]:
         """
         x: in shape (batch_size, sequence_length, d_model)
         return: A tensor of shape (batch_size, sequence_length, d_model)
@@ -161,11 +167,11 @@ class RMSNorm(nn.Module):
         d_model_size = x.shape[-1]
         # Reduce along x's final dimension of size d_model in square sum
         rms = torch.sqrt(
-            reduce(torch.square(x), "b s d_model -> b s", reduction="sum")
+            reduce(torch.square(x), "... d_model -> ...", reduction="sum")
             / d_model_size
             + self.eps
         )
-        # For element-wise division to work we need to satisfy the broadcasting semantics
+        # For elementwise division to work we need to satisfy the broadcasting semantics
         # Here rms is in shape (b, s) while the dividend (number to be divided) in shape (b, s, d_model)
         # Thus adjust rms to shape (b, s, 1) for broadcasting to work
         rms = rearrange(rms, "b s -> b s 1")
@@ -218,7 +224,9 @@ class FFN(nn.Module):
             )
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "batch_size seq_len d_model"]
+    ) -> Float[Tensor, "batch_size seq_len d_model"]:
         """
         Spec:
 
@@ -300,35 +308,38 @@ class RotaryPositionalEmbedding(nn.Module):
         self.register_buffer("cos", torch.cos(freqs), persistent=False)
         self.register_buffer("sin", torch.sin(freqs), persistent=False)
 
-    def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: Float[Tensor, "... seq_len d_k"],
+        token_positions: Int[Tensor, "... seq_len"],
+    ) -> Float[Tensor, "... seq_len d_k"]:
         """
-        x: tensor of shape (..., seq_len, d_k)
-        token_positions: a tensor of shape (..., seq_len) specifying the token
+        token_positions: a tensor of shape (... seq_len) specifying the token
             positions of x along the sequence dimension.
         return: a tensor of the same shape as x.
 
         Spec:
         Identify the rotation matrices to use by given token position.
-            Do this w/ Pytorch's advanced indexing: R[token_positions] -> tensor of shape (..., seq_len, d_k, d_k)
-        Multiply a token's embedding vector of shape (d_k,) w/ the corresponding identified rotation matrix of shape (d_k, d_k)
+            Do this w/ Pytorch's advanced indexing: R[token_positions] -> tensor of shape (... seq_len d_k d_k)
+        Multiply a token's embedding vector of shape (d_k,) w/ the corresponding identified rotation matrix of shape (d_k d_k)
         """
-        # (batch, seq, d_embed/2)
+        # (batch seq d_embed/2)
         # print(f'x shape: {x.shape} token_positions shape: {token_positions.shape}')
         cos_by_pos = self.cos[token_positions]
         sin_by_pos = self.sin[token_positions]
         # print(f'cos_by_pos shape before repeating: {cos_by_pos.shape}')
 
-        # (batch, 1, seq, d_embed/2)
+        # (batch 1 seq d_embed/2)
         cos_by_pos = repeat(cos_by_pos, "... pos d -> ... 1 pos d")
         sin_by_pos = repeat(sin_by_pos, "... pos d -> ... 1 pos d")
         # print(f'cos_by_pos shape: {cos_by_pos.shape}')
 
         # rearrange x so that the last dimension is pair of embedding vector
         # component to be rotated
-        # x now of shape (batch, seq, d_embed/2, 2)
+        # x now of shape (batch seq d_embed/2 2)
         x = rearrange(x, "... (d p) -> ... d p", p=2)
         # print(f'x shape: {x.shape}')
-        # tensors below are of shape (batch, seq, d_embed/2)
+        # tensors below are of shape (batch seq d_embed/2)
         x_even_idx, x_odd_idx = x[..., 0], x[..., 1]
         # 2d rotation
         # print(f'x_even_idx shape: {x_even_idx.shape} cos_by_pos shape: {cos_by_pos.shape}')
@@ -426,14 +437,20 @@ class MultiheadSelfAttention(nn.Module):
         theta, max_seq_len: Parameters for initializing RoPE layer.
 
         Folllowing Vaswani et al. [2017], set d_k = d_v = d_model / h.
+        NOTE it is totally feasible to have (d_k or d_v) x h > d_model; The
+        left-hand-side operand represents the dimension of attention layer
+        which does not need to be equal to d_model. Yet, per lecture, variation
+        in such aspect seems not result in any significant difference wrt
+        model performance etc, so d_k = d_v = d_model / h becomes a convention
+        used in LLM training industry.
 
         For compute efficiency, we lump W_Q, W_K, W_V into a single large
         matrix instead of separating them, to reduce # matmuls to perform.
         """
         super().__init__()
         # Initialize following linear weights per assignment section 3.4.1
-        # W_Q, W_K, W_V all in shape (d_model (=h x d_k or h x d_v), d_model)
-        # W_O in shape (d_model, d_model (=h x d_v))
+        # W_Q, W_K, W_V all in shape (d_attn (=h x d_k or h x d_v = d_model here), d_model)
+        # W_O in shape (d_model, d_attn (=h x d_v = d_model here))
         std = d_model**-0.5
         # Stretch goal: Combine weights for Q, K, V into a single matrix to
         # reduce # matmuls. Implement W_QKV so that Q, K, V = W_QKV[0], W_QKV[1], W_QKV[2]
@@ -498,10 +515,10 @@ class MultiheadSelfAttention(nn.Module):
         # Reshape tensors so that on the last dimension resides per-head values subject to application of attention.
         # This way we avoid the hassle and inefficiency of for i in num_heads do Attention(Q_i, K_i, V_i) :D
         # Note d_head x d_embedding_per_head = d_embedding (aka d_model)
-        # QKV_all_h of shape (... 3, d_head, d_seq, d_embeddding_per_head)
+        # QKV_all_h of shape (... 3 d_head d_seq d_embeddding_per_head)
         XQKV_all_h = rearrange(
             # x @ Q.T, x @ K.T, x @ V.T in one go
-            # d_to_split_by_head == (d_k or d_v x h) == d_model
+            # d_to_split_by_head == d_attn (aka d_k or d_v x h) == d_model
             # `kind`: index subscript to select tensor for Q, k or V
             einsum(
                 x,
@@ -591,6 +608,7 @@ class TransformerBlock(nn.Module):
         """
         token_positions: Tensor holding token's position index in sequence. Can be a
         simple 1-D tensor (eg [0, 1, 2, 3, ...]) or a batched tensor.
+
         """
         # 1st sublayer
         x += self.multihead_attention(
@@ -686,3 +704,511 @@ class TransformerModel(nn.Module):
             return softmax(self.output_embedding(x), i=-1)
         else:
             return self.output_embedding(x)
+
+
+###############################################################################
+# Transformer model training code
+###############################################################################
+
+
+def cross_entropy_loss(
+    inputs: Float[Tensor, "batch_size vocab_size"],
+    targets: Int[Tensor, "batch_size"],
+) -> Float[Tensor, ""]:
+    """
+    input: Logits predicted by model. input[i] are the unormalized scores representing
+        the probability distribution of next item for the i-th sequence in given batch.
+    targets: The true next token of each sequence in given batch, serving as ground truth in computing the loss.
+    return: Cross entroy loss value across all sequences in given batch.
+
+    Spec:
+        For numerical stability of softmax, identify the max value per row in input and subtract input by these values, resulting tensor input'.
+        Compute softmax of input' over the last dim.
+        Get the predicted probability of ground truth token per sequence from input' w/ advanced indexing over targets, denoting the resultant tensor predicted.
+        Return predicted's avg as final result.
+
+    Naively, we simply reuse the existing softmax impl. But this can result in
+    numerical overflows.
+    ```
+    softmaxed = softmax(inputs, i=-1)
+    # NOTE the selector formula: value in the 1st item identify vectors
+    # selected in 1st dim of softmaxed, while targets identify vectors selected
+    # in remaining dims of softmaxed, all the way till its dim.
+    # More see "Indexing with multidimensional index arrays" in
+    # https://numpy.org/doc/stable/user/basics.indexing.html#integer-array-indexing
+    ground_truth_item_predicted_probabilities = softmaxed[torch.arange(0, softmaxed.shape[0]), targets]
+    return -torch.log(ground_truth_item_predicted_probabilities).mean()
+    ```
+    """
+    maxes, _ = inputs.max(dim=-1, keepdim=True)
+    inputs_demaxed = inputs - maxes
+    # reduce by sum over exp on last dim
+    lg_inputs_exp_sum = torch.log(torch.exp(inputs_demaxed).sum(dim=-1))
+    return (
+        lg_inputs_exp_sum
+        - inputs_demaxed[torch.arange(0, inputs_demaxed.shape[0]), targets]
+    ).mean()
+
+
+###############################################################################
+# Transformer model compute resource accounting code
+###############################################################################
+
+# Reference impl per https://www.adamcasson.com/posts/transformer-flops
+
+
+def openai_flops_per_token(n_layers, n_heads, d_model, n_ctx, n_vocab, ff_ratio=4):
+    """Open AI method for forward pass FLOPs counting of decoder-only Transformer
+
+    openai_flops_per_token(n_layers=48, n_heads=25, d_model=1600, n_ctx=1024, n_vocab=50257, ff_ratio=4)
+    """
+    d_attn = d_model // n_heads
+    d_ff = d_model * ff_ratio
+
+    embeddings = 4 * d_model
+    attn_qkv = 2 * n_layers * d_model * 3 * (d_attn * n_heads)
+    attn_mask = 2 * n_layers * n_ctx * (d_attn * n_heads)
+    attn_project = 2 * n_layers * (d_attn * n_heads) * d_model
+    ff = 2 * n_layers * 2 * d_model * d_ff
+    logits = 2 * d_model * n_vocab
+
+    return embeddings + attn_qkv + attn_mask + attn_project + ff + logits
+
+
+def deepmind_flops_per_sequence(n_layers, n_heads, d_model, n_ctx, n_vocab, ff_ratio=4):
+    """DeepMind method for forwad pass FLOPs counting of decoder-only Transformer
+
+    deepmind_flops_per_sequence(n_layers=48, n_heads=25, d_model=1600, n_ctx=1024, n_vocab=50257, ff_ratio=4)
+    """
+    d_attn = d_model // n_heads
+    d_ff = d_model * ff_ratio
+
+    embeddings = 2 * n_ctx * n_vocab * d_model
+
+    attn_qkv = 2 * n_ctx * 3 * d_model * (d_attn * n_heads)
+    attn_logits = 2 * n_ctx * n_ctx * (d_attn * n_heads)
+    attn_softmax = 3 * n_heads * n_ctx * n_ctx
+    attn_reduce = 2 * n_ctx * n_ctx * (d_attn * n_heads)
+    attn_project = 2 * n_ctx * (d_attn * n_heads) * d_model
+    total_attn = attn_qkv + attn_logits + attn_softmax + attn_reduce + attn_project
+
+    ff = 2 * n_ctx * (d_model * d_ff + d_model * d_ff)
+
+    logits = 2 * n_ctx * d_model * n_vocab
+
+    return embeddings + n_layers * (total_attn + ff) + logits
+
+
+# Gauge result
+Result = namedtuple("Result", ["flops", "mem"])
+
+
+class Gauge:
+    """
+    Gauge the compute resource to be used by a Transformer model of given specs.
+    Supported compute resource types:
+    - FLOPs
+    - Memory usage
+
+    Assume the Transformer model being measured uses RoPE.
+
+    Calculation of memory usage is more subtle: Naive summation of memory
+    usaged in each compute component IMO doesn't make sense, as memory (either
+    machine's physical RAM or accelerator's on-device mem) got allocated and
+    released as computation comes and goes. IMO it makes more sense to measure
+    the size of data which remains in memory during forward and backward pass
+    of the model.
+
+    Update: The memory number is very fishy :D Not trustworthy. The FLOPs
+    number reflects the fact that compute at FFN layers consumes the most FLOPs
+    in Transformer model architecture, BUT the trend my computation reflects as
+    model trainable params size increases / sequence length increases doesn't
+    seem right (e.g. I observed that my computation shows compute at FFN layers
+    dropped significantly to below 50% as sequence length increased to 10k
+    level and compute at attention layer reaches 50% and above, while other
+    sources claims compute at attention layer does increases along w/ sequence
+    length but only amounts to a rather small portion of the total FLOPs, say
+    30-40%)
+
+    To clarify my understanding and fix potential bugs in my compute resource
+    accounting logic, read and examine info from following sources:
+    - https://www.adamcasson.com/posts/transformer-flops
+    - https://arxiv.org/abs/2203.15556
+    - https://kipp.ly/transformer-inference-arithmetic/
+    - https://jax-ml.github.io/scaling-book/
+    """
+
+    def __init__(
+        self,
+        input_shape: tuple[int, ...],
+        vocab_size: int,
+        context_len: int,
+        num_layers: int,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        dtype: torch.dtype | None = torch.float32,
+    ) -> None:
+        """
+        input_shape: Tuple representing the shape of input to Transformer
+            model. Its length represents the number of input's dimensions,
+            and its i-th item represents the size of input's i-th dimension
+            (aka number of elements *on* i-th dimension, not including
+            those in sub-dimensions). Typically (batch_size seq_len)
+        """
+        self.input_shape = input_shape
+        self.vocab_size = vocab_size
+        self.context_len = context_len
+        self.num_layers = num_layers
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        assert dtype is not None
+        self.dtype = dtype
+
+    def trainable_params(self) -> int:
+        """
+        Return total # trainable params of the Transformer model. This does not
+        account for input and positional embedding params.
+
+        **NOTE this is specific to model architecture.** So applies this only
+        to Transformer model architecture w/ following characteristics:
+            - Does NOT use Mixture-of-Expert (MoE)
+            - Attention layer dimension (d_attn) == model's hidden dimension (d_model)
+            - Use SwiGLU for elementwise feed-forward network layer (FFN)
+
+        Models of different arch entails use of components and math formula w/
+        params of different sizes. Thus it makes less sense to blindly apply
+        this to them. E.g. applying this to GPT-2 XL per assignment will yield
+        ~2.04B trainable params, 36% over the official 1.5B number. Note GPT-2
+        was released in 2019 and uses math formula different than SwiGLU in its
+        FFN layers[1], which entails 2 weight matrices instead of 3 in SwiGLU.
+
+        Use this to estimate the size of a Transformer model in bytes.
+
+        Spec:
+            - Per Transformer block, we have 2 RMSNorms, 1 MHA and 1 FFN.
+              # params = 2 * d_model + 4 * d_model ** 2 + 3 * (d_model * d_ff)
+            - Besides Transformer blocks, we have 1 post transformer block
+              RMSNorm layer, 1 linear layer for output embedding.
+              # params = d_model + d_model * vocab_size
+            So total trainable params = num_layers * (2 * d_model + 4 * d_model ** 2
+                + 3 * (d_model * d_ff)) + d_model * (1 + vocab_size)
+
+        Verified this formula w/ llama3 8b and 70b model specs [2] and confirmed
+        it yields result at 8b and 70b mark:
+
+        ```
+        llama3_8b = Gauge(input_shape=(1, 8000), vocab_size=128000, context_len=8000,
+            num_layers=32, d_model=4096, num_heads=32, d_ff=14336, dtype=torch.float32)
+        llama3_8b.trainable_params()
+        8309182464
+
+        llama3_70b = Gauge(input_shape=(1, 8000), vocab_size=128000, context_len=8000,
+            num_layers=80, d_model=8192, num_heads=64, d_ff=28672, dtype=torch.float32)
+        78896177152
+        ```
+
+        [1] https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf
+        [2] https://arxiv.org/pdf/2407.21783 Search for "Overview of the key hyperparameters of Llama 3"
+        """
+        return self.num_layers * (
+            2 * self.d_model + 4 * self.d_model**2 + 3 * (self.d_model * self.d_ff)
+        ) + self.d_model * (1 + self.vocab_size)
+
+    def gauge(self) -> Result:
+        """
+        Spec:
+
+        Assume:
+            - Operations e.g. rearrange, indexing cost no FLOPs.
+
+        Est. FLOPs required
+            = num_layer x FLOPs per transformer block +
+              1 RMSNorm over x's dims +
+              1 linear transform on x +
+              1 softmax on linear transformed result
+
+        TODO Est. memory required - Need to reconsider whether it
+        really makes sense to return mem usage in each subsequent
+        gauge_ methods.
+        """
+        # Input embedding layer occupies memory space
+        mem_input_embedding = self.vocab_size * self.d_model * self.dtype.itemsize
+        # TODO need to account for the new tensor created from advanced indexing?
+
+        transformer_block_input_shape = (*self.input_shape, self.d_model)
+        # FLOPs and mem usage per transformer block
+        flops_block, mem_block = self.gauge_transformer_block(
+            transformer_block_input_shape,
+            self.num_heads,
+            self.d_ff,
+            self.dtype,
+        )
+
+        flops_norm, mem_norm = self.gauge_rms_norm(
+            transformer_block_input_shape,
+            self.dtype,
+        )
+
+        flops_lnr, mem_lnr = self.gauge_linear(
+            transformer_block_input_shape,
+            self.vocab_size,
+            self.dtype,
+        )
+
+        flops_sm, mem_sm = self.gauge_softmax(
+            transformer_block_input_shape,
+            dim=-1,
+        )
+
+        flops_total = self.num_layers * flops_block + flops_norm + flops_lnr + flops_sm
+        log.info(f"FLOPs per transformer block: {flops_block}")
+        log.info(
+            f"FLOPs of all transformer blocks: {self.num_layers * flops_block}"
+            f" {self.num_layers * flops_block / flops_total * 100:.2f}% of model's total FLOPs"
+        )
+        log.info(f"FLOPs of post transformer block norm: {flops_norm}")
+        log.info(f"FLOPs of output embedding linear layer: {flops_lnr}")
+        log.info(f"FLOPs of final softmax: {flops_sm}")
+
+        mem_total = (
+            mem_input_embedding
+            + self.num_layers * mem_block
+            + mem_norm
+            + mem_lnr
+            + mem_sm
+        )
+        return Result(flops=flops_total, mem=mem_total)
+
+    def gauge_transformer_block(
+        self,
+        input_shape: tuple[int, ...],
+        num_heads: int,
+        d_ff: int,
+        dtype: torch.dtype,
+    ) -> Result:
+        """
+        Est. FLOPs required =
+            2 RMSNorm on x's dim +
+            1 multihead attention on x's dim +
+            2 elementwise add on x's dim +
+            1 FFN on x's dim
+        """
+        flops_norm, mem_norm = self.gauge_rms_norm(input_shape, dtype)
+        flops_mha, mem_mha = self.gauge_multihead_attention(
+            input_shape, num_heads, dtype
+        )
+        flops_ffn, mem_ffn = self.gauge_ffn(input_shape, d_ff, dtype)
+        flops_total = 2 * flops_norm + flops_mha + flops_ffn + 2 * prod(input_shape)
+        log.info(
+            "FLOPs of multihead attention per Transformer block:"
+            f" {flops_mha} {flops_mha / flops_total * 100:.2f}% of FLOPs per"
+            " Transformer block"
+        )
+        log.info(
+            "FLOPs of elementwise feed-forward layer per Transformer"
+            f" block: {flops_ffn} {flops_ffn / flops_total * 100:.2f}% of FLOPs"
+            " per Transformer block"
+        )
+        mem_total = mem_mha + mem_ffn
+        return Result(flops=flops_total, mem=mem_total)
+
+    def gauge_rms_norm(
+        self, input_shape: tuple[int, ...], dtype: torch.dtype
+    ) -> Result:
+        """
+        Est. FLOPs required =
+            1 elementwise square on x +
+            1 summation along x's last dim +
+            1 division + 1 addition + 1 sqrt on reduced x, elementwise +
+            1 mul + 1 div on x, elementwise
+        """
+        input_size = prod(input_shape)
+        d_model = input_shape[-1]
+        flops_sum = 0
+        # elementwise square
+        flops_sum += input_size
+        reduced_input_size = prod(input_shape[:-1])
+        # reduce by sum along input's last dim
+        flops_sum += reduced_input_size * (input_shape[-1] - 1)
+        # ops on reduced input
+        flops_sum += 3 * reduced_input_size
+        flops_sum += 2 * input_size
+        # TODO memory usage?
+        return Result(flops=flops_sum, mem=d_model * dtype.itemsize)
+
+    def gauge_linear(
+        self, input_shape: tuple[int, ...], d_out: int, dtype: torch.dtype
+    ) -> Result:
+        """
+        It is more intuitive to consider first how many items there are in the
+        resultant matrix after linear transformation, then consider how many
+        ops are spent to calculate each item.
+
+        Est. FLOPs required = resultant matrix size x ([# mul ops] size of dim reduced + [# add ops] size of dim reduced - 1)
+            = prod(input's dims except last one, d_out) x (2 x size of input's last dim - 1)
+        """
+        reduced_dim_size = input_shape[-1]
+        result_size = prod(input_shape[:-1]) * d_out
+        flops = result_size * (2 * reduced_dim_size - 1)
+
+        # numel = number of tensor elements in memory
+        # linear layer weight size
+        numel = reduced_dim_size * d_out
+        # resultant matrix size
+        numel += result_size * dtype.itemsize
+        return Result(flops=flops, mem=numel * dtype.itemsize)
+
+    def gauge_softmax(self, input_shape: tuple[int, ...], dim: int) -> Result:
+        """
+        dim: Index of input dimension to apply softmax, size of this dimension
+            is `input_shape[dim]`
+
+        FLOPs estimate only applies to the naive softmax implemented here.
+
+        Est. FLOPs required =
+            1 max over x's i-th dim +
+            1 elementwise sub and exp on x's dims +
+            1 summation on x's i-th dim +
+            1 elementwise div on x's dims
+        """
+        input_size = prod(input_shape)
+        softmaxed_dim_size = input_shape[dim]
+        # max and summation over dimension dim
+        flops = 2 * input_size / softmaxed_dim_size * (softmaxed_dim_size - 1)
+        flops += 3 * input_size
+        # TODO memory usage?
+        return Result(flops=flops, mem=0)
+
+    def gauge_multihead_attention(
+        self, input_shape: tuple[int, ...], num_heads: int, dtype: torch.dtype
+    ) -> Result:
+        """
+        Assume:
+            - d_k = k_v = d_model / num_heads
+
+        For RoPE, est. FLOPs required = 6 elementwise op on dim (batch_size seq_len d_model/2)
+            = 6 * prod(x's dims) / 2
+            = 3 * x.numel()
+
+        Est. FLOPs required (assumed application of RoPE) =
+            2 x prod(x's prefixing dims) x d_seq x 3 x d_model x d_model +
+            3 x prod(rope function input dims, aka (... 2 d_head d_seq d_embedding_per_head) ) +
+            scaled dot attention layer +
+                2 * Q.numel() * seq_len * (2 + 3/d_k)
+                = 2 * prod(... d_head d_seq d_embedding_per_head) * d_seq * (2 + 3 * h / d_model)
+            tensor stacking allocates mem and returns a new tensor +
+            matmul w/ W_O
+                2 x prod(... d_seq d_model) x d_model
+        """
+        # batched matmul b/w x and QKV
+        d_model, d_seq = input_shape[-1], input_shape[-2]
+        input_size = prod(input_shape)
+        flops, mem = (3 * v for v in self.gauge_linear(input_shape, d_model, dtype))
+
+        # RoPE on Q, K
+        flops += 3 * (input_size * 2)
+        # RoPE layer precomputed angle data
+        # TODO currently we create RotaryPositionalEmbedding module for each
+        # transformer block and repeatedly compute the sin and cos of the same
+        # rotation angle. For efficient use of memory space, is there a way to
+        # share such data across multiple nn modules?
+        # Memory usage by RoPE module
+        mem += (self.context_len * d_model) * dtype.itemsize
+        # NOTE mask tensor data type = torch.bool whose element occupies 1 byte
+        mem_attn_mask = d_seq**2
+        mem += mem_attn_mask
+
+        batched_xq_dims = (
+            *input_shape[:-2],
+            self.num_heads,
+            d_seq,
+            d_model // self.num_heads,
+        )
+        flops_attn, mem_attn = self.gauge_scaled_dot_product_attention(
+            batched_xq_dims,
+            batched_xq_dims,
+            batched_xq_dims,
+            dtype,
+        )
+        flops += flops_attn
+        mem += mem_attn
+        # pytorch tensor stacking allocates and returns a new tensor of the same shape as input
+        mem += input_size * dtype.itemsize
+        # matmul w/ W_O
+        flops_outer_matmul, mem_outer_matmul = self.gauge_linear(
+            input_shape, d_model, dtype
+        )
+        flops += flops_outer_matmul
+        mem += mem_outer_matmul
+        return Result(flops=flops, mem=mem)
+
+    def gauge_scaled_dot_product_attention(
+        self,
+        Q_shape: tuple[int, ...],
+        K_shape: tuple[int, ...],
+        V_shape: tuple[int, ...],
+        dtype: torch.dtype,
+    ) -> Result:
+        """
+        Input of scaled_dot_product_attention function as follow:
+            Q: Float[Tensor, "... queries d_k"],
+            K: Float[Tensor, "... keys d_k"],
+            V: Float[Tensor, "... values d_v"],
+            mask: Bool[Tensor, "... queries keys"] | None = None,
+
+        Here we assume queries = keys = d_seq
+
+        Est. FLOPs required =
+            1 matmul(Q, K) +
+            1 elementwise div at dim of matmul(Q, K) +
+            1 softmax at at dim of matmul(Q, K) +
+            1 matmul(matmul(Q, K), V)
+            In practice, d_k = d_v and keys = seq_len, so reduce above to
+            following:
+            = 2 * Q.numel() * seq_len * (2 + 3/d_k)
+        """
+        # batched matmul b/w Q, K
+        flops, mem = self.gauge_linear(Q_shape, K_shape[-2], dtype)
+        # NOTE gauge_linear accounts for size of linear transform weight when
+        # compute memory usage. Here however we need to discount it, as the
+        # weights have been accounted for in gauge_multihead_attention(),
+        # precisely its very 1st call to gauge_linear(). Still we need to
+        # account for the size of new matrix returned from linear transform.
+        # The same applies to below.
+        mem -= (Q_shape[-1] * K_shape[-2]) * dtype.itemsize
+        QK_shape = (*Q_shape[:-1], K_shape[-2])
+        flops_sm, mem_sm = self.gauge_softmax(QK_shape, dim=-1)
+        flops += flops_sm
+        # batched matmul b/w QK, V
+        flops_qkv, mem_qkv = self.gauge_linear(QK_shape, V_shape[-1], dtype)
+        flops += flops_qkv
+        mem_qkv -= (QK_shape[-1] * V_shape[-1]) * dtype.itemsize
+        mem += mem_qkv
+        return Result(flops=flops, mem=mem)
+
+    def gauge_ffn(
+        self, input_shape: tuple[int, ...], d_ff: int, dtype: torch.dtype
+    ) -> Result:
+        """
+        Est. FLOPs required =
+            matmul(x, w1) +
+            elementwise sigmoid + elementwise mul of matmul(x, w1) +
+            matmul(x, w3) +
+            elementwise mul of matmul(x, w1) +
+            matmul w/ w2
+        """
+        d_model = input_shape[-1]
+        # matmul(x, w1) and matmul(x, w3)
+        flops, mem = (v * 2 for v in self.gauge_linear(input_shape, d_ff, dtype))
+        inner_mat_shape = (*input_shape[:-1], d_ff)
+        # elementwise sigmoid (4 ops per its math formula) and 2 mul of inner matrix
+        flops += (4 + 2) * prod(inner_mat_shape)
+        # matmul w/ w2
+        flops_outer_matmul, mem_outer_matmul = self.gauge_linear(
+            inner_mat_shape, d_model, dtype
+        )
+        flops += flops_outer_matmul
+        mem += mem_outer_matmul
+        return Result(flops, mem)

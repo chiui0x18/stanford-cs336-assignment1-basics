@@ -23,6 +23,7 @@ from cs336_basics.transformer import (
     MultiheadSelfAttention,
     TransformerBlock,
     TransformerModel,
+    cross_entropy_loss,
 )
 
 
@@ -566,6 +567,7 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
+    return cross_entropy_loss(inputs, targets)
     raise NotImplementedError
 
 
