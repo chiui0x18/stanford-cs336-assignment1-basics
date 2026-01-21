@@ -707,50 +707,6 @@ class TransformerModel(nn.Module):
 
 
 ###############################################################################
-# Transformer model training code
-###############################################################################
-
-
-def cross_entropy_loss(
-    inputs: Float[Tensor, "batch_size vocab_size"],
-    targets: Int[Tensor, "batch_size"],
-) -> Float[Tensor, ""]:
-    """
-    input: Logits predicted by model. input[i] are the unormalized scores representing
-        the probability distribution of next item for the i-th sequence in given batch.
-    targets: The true next token of each sequence in given batch, serving as ground truth in computing the loss.
-    return: Cross entroy loss value across all sequences in given batch.
-
-    Spec:
-        For numerical stability of softmax, identify the max value per row in input and subtract input by these values, resulting tensor input'.
-        Compute softmax of input' over the last dim.
-        Get the predicted probability of ground truth token per sequence from input' w/ advanced indexing over targets, denoting the resultant tensor predicted.
-        Return predicted's avg as final result.
-
-    Naively, we simply reuse the existing softmax impl. But this can result in
-    numerical overflows.
-    ```
-    softmaxed = softmax(inputs, i=-1)
-    # NOTE the selector formula: value in the 1st item identify vectors
-    # selected in 1st dim of softmaxed, while targets identify vectors selected
-    # in remaining dims of softmaxed, all the way till its dim.
-    # More see "Indexing with multidimensional index arrays" in
-    # https://numpy.org/doc/stable/user/basics.indexing.html#integer-array-indexing
-    ground_truth_item_predicted_probabilities = softmaxed[torch.arange(0, softmaxed.shape[0]), targets]
-    return -torch.log(ground_truth_item_predicted_probabilities).mean()
-    ```
-    """
-    maxes, _ = inputs.max(dim=-1, keepdim=True)
-    inputs_demaxed = inputs - maxes
-    # reduce by sum over exp on last dim
-    lg_inputs_exp_sum = torch.log(torch.exp(inputs_demaxed).sum(dim=-1))
-    return (
-        lg_inputs_exp_sum
-        - inputs_demaxed[torch.arange(0, inputs_demaxed.shape[0]), targets]
-    ).mean()
-
-
-###############################################################################
 # Transformer model compute resource accounting code
 ###############################################################################
 
