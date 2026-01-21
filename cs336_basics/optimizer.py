@@ -1,4 +1,3 @@
-from math import sqrt
 from collections.abc import Iterable
 from typing import Any, Callable, Optional
 import torch
@@ -63,17 +62,20 @@ class AdamW(Optimizer):
         betas: tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-8,
         weight_decay: float = 1e-2,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = torch.float32,
     ) -> None:
         """
         lr: learning rate
         weight_decay: weight decay rate
         """
         defaults = {
-            "lr": lr,
-            "beta1": betas[0],
-            "beta2": betas[1],
-            "eps": eps,
-            "weight_decay": weight_decay,
+            "lr": torch.tensor(lr, device=device, dtype=dtype),
+            "beta1": torch.tensor(betas[0], device=device, dtype=dtype),
+            "beta2": torch.tensor(betas[1], device=device, dtype=dtype),
+            "eps": torch.tensor(eps, device=device, dtype=dtype),
+            "weight_decay": torch.tensor(weight_decay, device=device,
+                                         dtype=dtype),
         }
         super().__init__(params, defaults)
 
@@ -87,6 +89,8 @@ class AdamW(Optimizer):
         TODO: Refactor for performance and being more idiomatic.
         '''
         loss = None if closure is None else closure()
+        # What are self.param_groups and self.state? See
+        # https://docs.pytorch.org/docs/stable/generated/torch.optim.Optimizer.state_dict.html#torch.optim.Optimizer.state_dict
         for param_group in self.param_groups:
             lr = param_group["lr"]
             beta1, beta2 = param_group["beta1"], param_group["beta2"]
@@ -98,20 +102,31 @@ class AdamW(Optimizer):
                     continue
 
                 state = self.state[p]
-                t = state.get("t", 1)
-                m = state.get("m", torch.zeros_like(p))
-                v = state.get("v", torch.zeros_like(p))
+                if len(state) == 0:
+                    state['t'] = torch.tensor(1, dtype=p.dtype)
+                    state['m'] = torch.zeros_like(p,
+                                                  memory_format=torch.preserve_format)
+                    state['v'] = torch.zeros_like(p,
+                                                  memory_format=torch.preserve_format)
 
-                grad = p.grad.data
-                m = beta1 * m + (1 - beta1) * grad
-                v = beta2 * v + (1 - beta2) * torch.square(grad)
-                lr_t = lr * sqrt(1 - beta2**t) / (1 - beta1**t)
-                d1 = lr_t * m / (torch.sqrt(v) + eps)
-                d2 = lr * weight_decay * p.data
-                p.data -= d1 + d2
+                t: torch.Tensor = state.get("t")
+                m: torch.Tensor = state.get("m")
+                v: torch.Tensor = state.get("v")
 
-                state["t"] = t + 1
-                state["m"] = m
-                state["v"] = v
+                # paradigm commented out below is discouraged in Pytorch
+                # grad = p.grad.data
+                with torch.no_grad():
+                    grad = p.grad
+                    # use in-place tenor ops to avoid unnecessary mem pressure
+                    # due to creation of intermediate tensors
+                    m.mul_(beta1).add_(grad, alpha=1-beta1)
+                    v.mul_(beta2).addcmul_(grad, grad, value=1-beta2)
+                    # Apply weight decay first; See spec in Pytorch doc
+                    p.mul_(1 - lr * weight_decay)
+                    lr_t = lr * torch.sqrt(1 - beta2**t) / (1 - beta1**t)
+                    # descent
+                    p.addcdiv_(m, torch.sqrt(v).add_(eps), value=-lr_t)
+
+                t.add_(1)
 
         return loss
