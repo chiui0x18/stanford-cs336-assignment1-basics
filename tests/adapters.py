@@ -27,6 +27,7 @@ from cs336_basics.transformer import (
 from cs336_basics.optimizer import (
     cross_entropy_loss,
     AdamW,
+    cosine_annealing_lr_scheduler,
 )
 
 
@@ -620,7 +621,16 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    # NOTE we have to use data type of precision higher than float32 to meet
+    # the comparison criteria set by UT
+    scheduler = cosine_annealing_lr_scheduler(
+        lr_max=max_learning_rate,
+        lr_min=min_learning_rate,
+        t_warmup=warmup_iters,
+        t_cool=cosine_cycle_iters,
+        dtype=torch.float64,
+    )
+    return scheduler(torch.tensor(it, dtype=torch.float64))
 
 
 def run_save_checkpoint(

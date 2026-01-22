@@ -1,4 +1,4 @@
-from collections.abc import Iterable
+from collections.abc import Iterable, Callable
 from typing import Any, Callable, Optional
 import torch
 from torch.optim import Optimizer
@@ -74,20 +74,19 @@ class AdamW(Optimizer):
             "beta1": torch.tensor(betas[0], device=device, dtype=dtype),
             "beta2": torch.tensor(betas[1], device=device, dtype=dtype),
             "eps": torch.tensor(eps, device=device, dtype=dtype),
-            "weight_decay": torch.tensor(weight_decay, device=device,
-                                         dtype=dtype),
+            "weight_decay": torch.tensor(weight_decay, device=device, dtype=dtype),
         }
         super().__init__(params, defaults)
 
     def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
-        '''
+        """
         Below presents a naive AdamW implementation.
         It is correct, however neither Pytorch idiomatic nor performant.
 
         Per ChatGPT, hardware accelerators excel when all math ops are expressed as tensor operations.
 
         TODO: Refactor for performance and being more idiomatic.
-        '''
+        """
         loss = None if closure is None else closure()
         # What are self.param_groups and self.state? See
         # https://docs.pytorch.org/docs/stable/generated/torch.optim.Optimizer.state_dict.html#torch.optim.Optimizer.state_dict
@@ -103,15 +102,17 @@ class AdamW(Optimizer):
 
                 state = self.state[p]
                 if len(state) == 0:
-                    state['t'] = torch.tensor(1, dtype=p.dtype)
-                    state['m'] = torch.zeros_like(p,
-                                                  memory_format=torch.preserve_format)
-                    state['v'] = torch.zeros_like(p,
-                                                  memory_format=torch.preserve_format)
+                    state["t"] = torch.tensor(1, dtype=p.dtype)
+                    state["m"] = torch.zeros_like(
+                        p, memory_format=torch.preserve_format
+                    )
+                    state["v"] = torch.zeros_like(
+                        p, memory_format=torch.preserve_format
+                    )
 
-                t: torch.Tensor = state.get("t")
-                m: torch.Tensor = state.get("m")
-                v: torch.Tensor = state.get("v")
+                t: Tensor = state.get("t")
+                m: Tensor = state.get("m")
+                v: Tensor = state.get("v")
 
                 # paradigm commented out below is discouraged in Pytorch
                 # grad = p.grad.data
@@ -119,8 +120,8 @@ class AdamW(Optimizer):
                     grad = p.grad
                     # use in-place tenor ops to avoid unnecessary mem pressure
                     # due to creation of intermediate tensors
-                    m.mul_(beta1).add_(grad, alpha=1-beta1)
-                    v.mul_(beta2).addcmul_(grad, grad, value=1-beta2)
+                    m.mul_(beta1).add_(grad, alpha=1 - beta1)
+                    v.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
                     # Apply weight decay first; See spec in Pytorch doc
                     p.mul_(1 - lr * weight_decay)
                     lr_t = lr * torch.sqrt(1 - beta2**t) / (1 - beta1**t)
@@ -130,3 +131,46 @@ class AdamW(Optimizer):
                 t.add_(1)
 
         return loss
+
+
+def cosine_annealing_lr_scheduler(
+    lr_max: float,
+    lr_min: float,
+    t_warmup: int,
+    t_cool: int,
+    device: torch.device | None = None,
+    dtype: torch.dtype | None = torch.float32,
+) -> Callable[[Tensor], Tensor]:
+    """
+    Implements cosine annealing learning rate scheduler mechanism. Its return
+    value is a scheduler backed by a callable which takes the current training
+    step and returns the learning rate to use at the current training step.
+
+    step: Scalar tensor representing training run step progress.
+
+    Spec:
+
+    It seems way better to use a closure to implement this, so that we
+    don't have to pass fixed params eg min and max learning rate over and
+    over when it is used.
+    """
+    t_warmup_ = torch.tensor(t_warmup, device=device, dtype=dtype)
+    t_cool_ = torch.tensor(t_cool, device=device, dtype=dtype)
+    lr_max_ = torch.tensor(lr_max, device=device, dtype=dtype)
+    lr_min_ = torch.tensor(lr_min, device=device, dtype=dtype)
+
+    def scheduler(t: Tensor) -> Tensor:
+        """
+        t: Current training run step represented by a scalar tensor.
+        """
+        if t < t_warmup_:
+            return lr_max_.mul(t / t_warmup_)
+        elif t <= t_cool_:
+            cos_eff: Tensor = (
+                (t - t_warmup_).mul_(torch.pi).div_(t_cool_ - t_warmup_).cos_().add_(1)
+            )
+            return lr_min_.addcmul(cos_eff, (lr_max_ - lr_min_), value=0.5)
+        else:
+            return lr_min_
+
+    return scheduler
