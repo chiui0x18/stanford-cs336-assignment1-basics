@@ -1,10 +1,18 @@
+import numpy as np
+import numpy.typing as npt
 from collections.abc import Iterable, Callable
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, BinaryIO, IO
+import os
 import torch
+from torch._dynamo import optimize
 from torch.optim import Optimizer
-from torch import Tensor
+from torch import Tensor, nn, linalg
 from cs336_basics.log import get_logger
 from jaxtyping import Float, Bool, Int
+
+
+# NOTE Random number gen to generate batch of randomly sampled token sequences.
+_rng = np.random.default_rng()
 
 
 def cross_entropy_loss(
@@ -174,3 +182,121 @@ def cosine_annealing_lr_scheduler(
             return lr_min_
 
     return scheduler
+
+
+def grad_clipper(
+    max_norm: float,
+    eps: float = 1e-6,
+    device: torch.device | None = None,
+    dtype: torch.dtype | None = torch.float32,
+) -> Callable[[Iterable[nn.Parameter]], None]:
+    """
+    Creates logic to clip model parameters w/ given l2 norm.
+
+    Implement this as a closure.
+
+    max_norm: Maximum l2 norm to apply clipping.
+    return: A callable which takes a list of parameters and clip their gradient
+        in-place.
+    """
+
+    @torch.no_grad
+    def clip(params: Iterable[nn.Parameter]):
+        """
+        Spec:
+        1. Compute the l2 norm of gradient of all given parameters (gn2)
+        2. If gn2 < max_norm, nop and return.
+        3. Else divide all parameter gradients by max_norm / (gn2 + eps) in place
+
+        To minimize memory pressure, a naive solution may use given grad tensors
+        as scratch space and restore to correct output at the end. This turns out
+        introduce numerical stability issues to every gradient regardless whether
+        we apply clipping or not, so avoid it at all cost.
+        """
+        grads = [p.grad for p in params if p.grad is not None]
+        if not grads:
+            return
+        # NOTE logic below may lead to numerical stability issue but align w/
+        # Pytorch's practice. See
+        # https://github.com/pytorch/pytorch/blob/v2.10.0/torch/nn/utils/clip_grad.py#L102-L108
+        grad_l2_norm = linalg.vector_norm(
+            torch.stack(torch._foreach_norm(grads, ord=2)), ord=2
+        )
+
+        if grad_l2_norm < max_norm:
+            return
+
+        torch._foreach_mul_(grads, max_norm / grad_l2_norm.add_(eps))
+
+    return clip
+
+
+def get_batch(
+    x: npt.NDArray,
+    batch_size: int,
+    context_len: int,
+    device: str,
+) -> tuple[
+    Int[Tensor, "batch_size context_len"], Int[Tensor, "batch_size context_len"]
+]:
+    """
+    x: 1-d numpy array representing a single sequence of token IDs.
+
+    Spec:
+        Sample sequences in the resulting batch w/ sliding window.
+        For i := 0, i < batch_size, do
+            Turn slice x[i:i+context_len] to a tensor
+            Add the tensor to list seqs
+            Same applies to sequence of next tokens
+        done
+        Stack seqs and move the resulting tensor to given device
+    """
+    tokens_cnt = x.size
+    assert (
+        batch_size + context_len <= tokens_cnt
+    ), f"Input size too small to collect {batch_size} token sequences of length {context_len}"
+    in_seqs, nxt_tokens = [], []
+    # Turns out we have to sample sequences for the batch in random
+    max_possible_start_idx = tokens_cnt - context_len - 1
+    for i in _rng.choice(max_possible_start_idx + 1, size=batch_size, replace=False):
+        in_seqs.append(torch.from_numpy(x[i : i + context_len]))
+        nxt_tokens.append(torch.from_numpy(x[i + 1 : i + 1 + context_len]))
+
+    return (
+        torch.stack(in_seqs, dim=0).to(device=device),
+        torch.stack(nxt_tokens, dim=0).to(device=device),
+    )
+
+
+def save_checkpoint(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    iteration: int,
+    out: str | os.PathLike | BinaryIO | IO[bytes],
+) -> None:
+    state_dict_all = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "iteration": iteration,
+    }
+    torch.save(state_dict_all, out)
+
+
+def load_checkpoint(
+    src: str | os.PathLike | BinaryIO | IO[bytes],
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> int:
+    state_dict_all = torch.load(src)
+
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict_all["model"])
+    if missing_keys is not None and len(missing_keys) > 0:
+        raise Exception(f"Following keys missing in model state: {missing_keys}")
+    if unexpected_keys is not None and len(unexpected_keys) > 0:
+        raise Exception(
+            f"Following keys are not expected in model state: {unexpected_keys}"
+        )
+
+    optimizer.load_state_dict(state_dict_all["optimizer"])
+
+    return state_dict_all["iteration"]
