@@ -2,6 +2,7 @@ import json
 from collections import Counter, defaultdict
 import logging
 from collections.abc import Iterable, Iterator
+from os import PathLike
 
 # from heapq import heapify_max, heappush_max, heappop_max  # requires python3.14
 from heapq import heapify, heappush, heappop  # before python3.14
@@ -11,14 +12,9 @@ from cs336_basics.log import get_logger  # logging logic in local module
 from cs336_basics.pretokenizer import PRE_TOKENIZE_PAT
 import regex as re
 
-# Comment out imports like such which not needed by UTs to speed things up
-# TODO move the CLI logic to a different py module instead?
-# from pathlib import Path
-# import click
+UTF8 = "utf8"
 
 log = get_logger("bpe", level=logging.WARN)
-
-UTF8 = "utf8"
 
 
 class BpeIterationStates:
@@ -513,8 +509,11 @@ def _update_iteration_states(
 
 
 def train_bpe(
-    input_path: str, vocab_size: int, special_tokens: list[str]
+    input_path: str | PathLike, vocab_size: int, special_tokens: list[str]
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+    """
+    input_path: Path to the pretoken -> count mapping file.
+    """
     with open(input_path, encoding=UTF8) as f:
         pretokens: dict[str, int] = json.load(f)
 
@@ -584,7 +583,7 @@ class Tokenizer:
         # TODO what does the content look like in vocab_filepath and merges_filepath?
         with open(vocab_filepath) as f_vocab:
             with open(merges_filepath) as f_merges:
-                # FIXME clawning for now
+                # FIXME clowning for now
                 vocab = json.load(f_vocab)
                 merges = json.load(f_merges)
                 return cls(vocab, merges, special_tokens)
@@ -710,24 +709,3 @@ class Tokenizer:
         for t_id in ids:
             b.extend(self.vocab[t_id])
         return b.decode(encoding=UTF8, errors="replace")
-
-
-# @click.command(name="bpe")
-# @click.argument("infile", type=click.Path(exists=True, path_type=Path))
-# @click.argument("size", type=click.INT)
-# def run(infile: Path, size: int):
-#    """
-#    INFILE the file path of mapping of pretokens to their counts in text
-#    corpus.
-#
-#    SIZE the size of vocabulary that byte-pair encoding logic will build.
-#    """
-#    train_bpe(
-#        str(infile),
-#        vocab_size=size,
-#        special_tokens=["<|endoftext|>"],
-#    )
-#
-#
-# if __name__ == "__main__":
-#    run()

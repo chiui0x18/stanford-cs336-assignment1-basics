@@ -379,6 +379,7 @@ version = "1.0.6"
 source = { editable = "." }
 dependencies = [
     { name = "black" },
+    { name = "click" },
     { name = "einops" },
     { name = "einx" },
     { name = "jaxtyping" },
@@ -401,6 +402,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "black", specifier = ">=25.12.0" },
+    { name = "click", specifier = ">=8.2.1" },
     { name = "einops", specifier = ">=0.8.1" },
     { name = "einx", specifier = ">=0.3.0" },
     { name = "jaxtyping", specifier = ">=0.3.0" },
