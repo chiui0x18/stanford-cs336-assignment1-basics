@@ -1,4 +1,5 @@
 import json
+import pickle
 from collections import Counter, defaultdict
 import logging
 from collections.abc import Iterable, Iterator
@@ -564,6 +565,12 @@ class Tokenizer:
                 # to capture each special token in pretokenization
                 special_tokens_regexes.append(re.escape(t))
                 tb = t.encode(UTF8)
+                # NOTE logic below updates vocab used to create the tokenizer
+                # if a given special token is not present. However the updated
+                # vocab is not persisted. We shall avoid hitting this path esp.
+                # when using the tokenizer from CLI, by using the same list of
+                # special tokens used during BPE training to create the
+                # tokenizer.
                 if tb not in self.bytes_to_token:
                     new_token_id = len(vocab)
                     vocab[new_token_id] = tb
@@ -576,16 +583,14 @@ class Tokenizer:
     @classmethod
     def from_files(
         cls,
-        vocab_filepath: str,
-        merges_filepath: str,
+        vocab_fp: str | PathLike,
+        merges_fp: str | PathLike,
         special_tokens: list[str] | None = None,
     ) -> "Tokenizer":
-        # TODO what does the content look like in vocab_filepath and merges_filepath?
-        with open(vocab_filepath) as f_vocab:
-            with open(merges_filepath) as f_merges:
-                # FIXME clowning for now
-                vocab = json.load(f_vocab)
-                merges = json.load(f_merges)
+        with open(vocab_fp, "rb") as f_vocab:
+            with open(merges_fp, "rb") as f_merges:
+                vocab = pickle.load(f_vocab)
+                merges = pickle.load(f_merges)
                 return cls(vocab, merges, special_tokens)
 
     def encode(self, text: str) -> list[int]:
