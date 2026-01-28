@@ -578,7 +578,6 @@ def run_cross_entropy(
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
     return cross_entropy_loss(inputs, targets)
-    raise NotImplementedError
 
 
 def run_gradient_clipping(
@@ -635,7 +634,6 @@ def run_get_lr_cosine_schedule(
         lr_min=min_learning_rate,
         t_warmup=warmup_iters,
         t_cool=cosine_cycle_iters,
-        dtype=torch.float64,
     )
     return scheduler(torch.tensor(it, dtype=torch.float64))
 
@@ -736,4 +734,3 @@ def run_train_bpe(
         special_tokens=special_tokens,
     )
     return bpe_optimized(pretoken_cnts, vocab_size, special_tokens)
-    pass

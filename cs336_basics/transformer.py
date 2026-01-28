@@ -11,12 +11,14 @@ from cs336_basics.log import get_logger
 from jaxtyping import Float, Bool, Int
 
 # https://docs.pytorch.org/docs/stable/notes/randomness.html
+# For how to generate random seed see
+# https://numpy.org/doc/stable/reference/random/index.html#module-numpy.random
 # NOTE this has negative performance implications so be aware when using it in
 # production
-RNG_SEED = 10241
-random.seed(RNG_SEED)
-np.random.seed(RNG_SEED)
-torch.manual_seed(RNG_SEED)
+# RNG_SEED = 175067350307902360991065469783437699069
+# random.seed(RNG_SEED)
+# np.random.seed(RNG_SEED)
+# torch.manual_seed(RNG_SEED)
 
 log = get_logger("transformer", level=logging.DEBUG)
 
@@ -611,7 +613,15 @@ class TransformerBlock(nn.Module):
 
         """
         # 1st sublayer
-        x += self.multihead_attention(
+        # NOTE use of x += ... will upset Pytorch w/ err like following:
+        # > RuntimeError: one of the variables needed for gradient computation
+        # > has been modified by an inplace operation: [torch.FloatTensor [2, 16, 256]],
+        # > which is output 0 of AddBackward0, is at version 1; expected version 0 instead.
+        #
+        # Seems in-place tensor ops can mess up gradient computation
+        # Related SO post https://stackoverflow.com/a/73555548
+        # TODO What is the implication on memory footprint when using such paradigm?
+        x = x + self.multihead_attention(
             self.norm_pre_multihead_attention(x), token_positions
         )
         # 2nd sublayer
@@ -640,6 +650,9 @@ class TransformerModel(nn.Module):
         num_layers: Number of Transformer blocks to apply.
         d_model: Size of embedding vector dimension hidden in the Transformer model.
             Aka, the dimensionality of the model embeddings and sublayer outputs.
+
+        TODO Train different parts of a model w/ datatype of different precision
+            for effective use of compute resource.
         """
         super().__init__()
         # layer's input and output dim: (batch, seq_len) -> (batch, seq_len, d_model)

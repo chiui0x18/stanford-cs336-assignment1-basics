@@ -1,13 +1,16 @@
+import time
 import pickle
 import json
 from pathlib import Path
 from typing import IO
 import numpy as np
 import numpy.typing as npt
+import torch
 import click
 from cs336_basics.pretokenizer import pretokenize
 from cs336_basics.bpe import UTF8, train_bpe, Tokenizer
 from cs336_basics.log import get_logger
+from cs336_basics.train import train_loop
 
 
 log = get_logger("cli")
@@ -188,6 +191,7 @@ def cli_tokenize(
     # by memmap-backed file and 2/ handy support on array concatenation. This
     # also helps narrow down the program running time to only 1 pass over all
     # generated tokens.
+    time_start = time.time()
     tokenizer = Tokenizer.from_files(
         vocab_fp=cfg / "vocab.pkl",
         merges_fp=cfg / "merges.pkl",
@@ -216,7 +220,10 @@ def cli_tokenize(
     # Chances are there still exist tokens read to buf but not yet flushed to
     # disk. So flush once more.
     final = _flush_to_disk(final, out, buf, tokens_buf, dtype)
-    log.info(f"Encoded input text into {tokens_read} tokens")
+    duration_seconds = time.time() - time_start
+    log.info(
+        f"Encoded input text into {tokens_read} tokens in" f" {duration_seconds:.2f}s"
+    )
 
 
 def _flush_to_disk(
@@ -248,10 +255,207 @@ def _flush_to_disk(
         fp.unlink(missing_ok=True)
         log.exception("Error creating numpy memmap-backed array")
         raise
-
+    # Append tokens buffered to end of saved token sequence and flush the
+    # change to disk
     arr_[first_available_idx:] = buf[:tokens_buf]
     arr_.flush()
     return arr_
+
+
+@app.command(name="train", context_settings={"show_default": True})
+@click.argument(
+    "training_data", type=click.Path(exists=True, dir_okay=False, path_type=Path)
+)
+@click.argument(
+    "validation_data", type=click.Path(exists=True, dir_okay=False, path_type=Path)
+)
+@click.option(
+    "--bsize",
+    type=click.INT,
+    required=True,
+    default=16,
+    help="Batch size of training and validation data to sample and use per epoch",
+)
+@click.option(
+    "--vocab-size",
+    type=click.INT,
+    required=True,
+    default=None,
+    help="Token vocabulary size. This MUST match the size of token vocabulary"
+    " used to encode tokens from raw training and validation text data",
+)
+@click.option(
+    "--ctx-len",
+    type=click.INT,
+    required=True,
+    default=256,
+    help="Max length of sequence which the trained Transformer model can"
+    " process. TODO: Test what will happen if we feed sequence longer than this"
+    " to model",
+)
+@click.option(
+    "--layers",
+    type=click.INT,
+    required=True,
+    default=4,
+    help="Number of Transformer blocks to include in model to be trained",
+)
+@click.option(
+    "--d-model",
+    type=click.INT,
+    required=True,
+    default=512,
+    help="Size of model's dimension, aka Transformer model's hidden dimension",
+)
+@click.option(
+    "--heads",
+    type=click.INT,
+    required=True,
+    default=16,
+    help="Number of heads to use in model's multi-head attention layer",
+)
+@click.option(
+    "--d-ff",
+    type=click.INT,
+    required=True,
+    default=1344,
+    help="Size of Transformer model elementwise feed-forward network dimension."
+    " Recommend a value around 8/3 of model dimension and a multiple of 64",
+)
+@click.option(
+    "--theta", type=click.FLOAT, default=10000, help="Value of theta for RoPE"
+)
+@click.option(
+    "--tmax",
+    type=click.INT,
+    required=True,
+    default=16,
+    help="Max number of epochs the training loop will iterate",
+)
+@click.option(
+    "--twarmup",
+    type=click.INT,
+    default=16,
+    help="Number of epochs to warmup learning rate per cos annealling schedule",
+)
+@click.option(
+    "--tcool",
+    type=click.INT,
+    default=16,
+    help="Number of epochs after which cos annealling learning rate schedule ends",
+)
+@click.option(
+    "--lr-max",
+    type=click.FLOAT,
+    default=1e-2,
+    help="Max learning rate per cos annealling schedule",
+)
+@click.option(
+    "--lr-min",
+    type=click.FLOAT,
+    default=5e-4,
+    help="Min learning rate per cos annealling schedule",
+)
+@click.option(
+    "--grad-clip-norm",
+    type=click.FLOAT,
+    default=None,
+    help="L2 norm threshold to apply gradient clipping",
+)
+@click.option(
+    "--checkpoint-src",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Path to model checkpoint TODO handle resume of training from checkpoint",
+)
+@click.option(
+    "--checkpoint-interval",
+    type=click.INT,
+    default=None,
+    help="Interval, in # epochs, to checkpoint model training progress",
+)
+@click.option(
+    "--rand-seed",
+    type=click.INT,
+    default=None,
+    help="RNG seed for reproducible randomness behavior in debugging. Range in [0, 2^32-1]",
+)
+@click.option(
+    "--device",
+    type=click.STRING,
+    required=True,
+    default="cpu",
+    help="device to allocate tensors for model training",
+)
+@click.option(
+    "--dtype",
+    type=click.STRING,
+    required=True,
+    default="float32",
+    help="data type used for tensor representation and operations",
+)
+def cli_train(
+    training_data,
+    validation_data,
+    bsize: int,
+    vocab_size: int,
+    ctx_len: int,
+    layers: int,
+    d_model: int,
+    heads: int,
+    d_ff: int,
+    theta: float,
+    tmax: int,
+    twarmup: int,
+    tcool: int,
+    lr_max: float,
+    lr_min: float,
+    grad_clip_norm: float,
+    checkpoint_src: Path,
+    checkpoint_interval: int,
+    rand_seed: int,
+    device: str,
+    dtype: str,
+):
+    """
+    Run training loop for Transformer model of given spec.
+
+    TODO Argument for file path to save training checkpoints including the
+    final trained model data.
+    """
+    torch_dtype: torch.dtype = torch.float32
+    # TODO support other data types
+    match dtype:
+        case "bfloat16":
+            torch_dtype = torch.bfloat16
+        case "float16":
+            torch_dtype = torch.float16
+
+    train_set = np.memmap(training_data, dtype=np.uint32, mode="r")
+    valid_set = np.memmap(validation_data, dtype=np.uint32, mode="r")
+    train_loop(
+        train_set=train_set,
+        validation_set=valid_set,
+        batch_size=bsize,
+        vocab_size=vocab_size,
+        context_len=ctx_len,
+        num_layers=layers,
+        d_model=d_model,
+        num_heads=heads,
+        d_ff=d_ff,
+        rope_theta=theta,
+        t_max=tmax,
+        t_warmup=twarmup,
+        t_cool=tcool,
+        lr_max=lr_max,
+        lr_min=lr_min,
+        grad_clip_max_norm=grad_clip_norm,
+        checkpoint_src=checkpoint_src,
+        checkpoint_interval=checkpoint_interval,
+        rand_seed=rand_seed,
+        device=device,
+        dtype=torch_dtype,
+    )
 
 
 if __name__ == "__main__":

@@ -1,35 +1,32 @@
+import random
 import numpy as np
 import numpy.typing as npt
 from collections.abc import Iterable, Callable
-from typing import Any, Callable, Optional, BinaryIO, IO
+from typing import BinaryIO, IO
 import os
 import torch
-from torch._dynamo import optimize
 from torch.optim import Optimizer
-from torch import Tensor, nn, linalg
-from cs336_basics.log import get_logger
-from jaxtyping import Float, Bool, Int
+from torch import Tensor, nn, linalg, autograd
+from jaxtyping import Float, Int, Int64
 
+from cs336_basics.log import get_logger
+from cs336_basics.transformer import TransformerModel
 
 # NOTE Random number gen to generate batch of randomly sampled token sequences.
 _rng = np.random.default_rng()
 
+log = get_logger("Train")
+
 
 def cross_entropy_loss(
     inputs: Float[Tensor, "batch_size vocab_size"],
-    targets: Int[Tensor, "batch_size"],
+    targets: Int64[Tensor, "batch_size"],
 ) -> Float[Tensor, ""]:
     """
     input: Logits predicted by model. input[i] are the unormalized scores representing
         the probability distribution of next item for the i-th sequence in given batch.
-    targets: The true next token of each sequence in given batch, serving as ground truth in computing the loss.
+    targets: Indices of the ground true next item of each sequence in given batch.
     return: Cross entroy loss value across all sequences in given batch.
-
-    Spec:
-        For numerical stability of softmax, identify the max value per row in input and subtract input by these values, resulting tensor input'.
-        Compute softmax of input' over the last dim.
-        Get the predicted probability of ground truth token per sequence from input' w/ advanced indexing over targets, denoting the resultant tensor predicted.
-        Return predicted's avg as final result.
 
     Naive impl: Inefficient mem use, does not work well w/ Pytorch middleware and
     hardware level parallelism machinary.
@@ -53,13 +50,52 @@ def cross_entropy_loss(
         - Simpler autograd graph for speedier backprop
         - Idiomatic Pytorch code
     """
-    # shape (batch_size )
+    # shape (batch_size,)
     logsumexp = torch.logsumexp(inputs, dim=-1)
-    # shape (batch_size 1) so squeeze out the last dim for subsequent subtraction
+    # torch.gather results in tensor of shape (batch_size 1) so
+    # squeeze out the last dim for subsequent subtraction
+    # Resultant tensor shape (batch_size,)
+    ground_truth_item_logits = torch.gather(
+        inputs,
+        dim=-1,
+        index=targets.unsqueeze(dim=-1),
+    ).squeeze(dim=-1)
+    # Take avg along the dimension of (sequence length if provided)
+    # and batch size, per equation (16) in assignment
+    return (logsumexp - ground_truth_item_logits).mean()
+
+
+def perplexity(
+    inputs: Float[Tensor, "seq_len vocab_size"],
+    targets: Int64[Tensor, "seq_len"],
+) -> Float[Tensor, ""]:
+    """
+    Compute perplexity metric of a given sequence.
+    NOTE This metric is not applicable to a batch of sequences; If given inputs and
+    targets has prefixing batch dimension, then call to this function returns a
+    1-D tensor, each item of which is the perplexity metric value of each sequence
+    in the batch.
+
+    For definition of Perplexity metric see section 3.2.2 of
+    [Hosseini et al. (2023)](https://arxiv.org/pdf/2301.09211)
+
+    input: Logits predicted by model. input[i] are the unormalized scores representing
+        the probability distribution of next item for the i-th sequence in given batch.
+    targets: The true next token of each sequence in given batch.
+
+    return: A scalar tensor if inputs and targets representing a particular
+    sequence, or a 1-D tensor if there exists a prefixing batch dimension.
+    """
+    # shape (seq_len,)
+    logsumexp = torch.logsumexp(inputs, dim=-1)
+    # torch.gather results in tensor of shape (seq_len 1) so
+    # squeeze out the last dim for subsequent subtraction
+    # resultant tensor shape (seq_len,)
     ground_truth_item_logits = torch.gather(
         inputs, dim=-1, index=targets.unsqueeze(dim=-1)
     ).squeeze(dim=-1)
-    return (logsumexp - ground_truth_item_logits).mean()
+
+    return (logsumexp - ground_truth_item_logits).mean(dim=-1).exp()
 
 
 class AdamW(Optimizer):
@@ -70,23 +106,23 @@ class AdamW(Optimizer):
         betas: tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-8,
         weight_decay: float = 1e-2,
-        device: torch.device | None = None,
-        dtype: torch.dtype | None = torch.float32,
+        lr_scheduler: Callable[[Tensor], Tensor] | None = None,
     ) -> None:
         """
         lr: learning rate
         weight_decay: weight decay rate
         """
         defaults = {
-            "lr": torch.tensor(lr, device=device, dtype=dtype),
-            "beta1": torch.tensor(betas[0], device=device, dtype=dtype),
-            "beta2": torch.tensor(betas[1], device=device, dtype=dtype),
-            "eps": torch.tensor(eps, device=device, dtype=dtype),
-            "weight_decay": torch.tensor(weight_decay, device=device, dtype=dtype),
+            "lr": lr,
+            "beta1": betas[0],
+            "beta2": betas[1],
+            "eps": eps,
+            "weight_decay": weight_decay,
         }
         super().__init__(params, defaults)
+        self.lr_scheduler = lr_scheduler
 
-    def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
+    def step(self, closure: Callable[[], float] | None = None) -> float | None:
         """
         Below presents a naive AdamW implementation.
         It is correct, however neither Pytorch idiomatic nor performant.
@@ -132,7 +168,11 @@ class AdamW(Optimizer):
                     v.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
                     # Apply weight decay first; See spec in Pytorch doc
                     p.mul_(1 - lr * weight_decay)
-                    lr_t = lr * torch.sqrt(1 - beta2**t) / (1 - beta1**t)
+                    # Compute lr w/ scheduler if present
+                    if self.lr_scheduler is not None:
+                        lr_t = self.lr_scheduler(t)
+                    else:
+                        lr_t = lr * torch.sqrt(1 - beta2**t) / (1 - beta1**t)
                     # descent
                     p.addcdiv_(m, torch.sqrt(v).add_(eps), value=-lr_t)
 
@@ -146,8 +186,6 @@ def cosine_annealing_lr_scheduler(
     lr_min: float,
     t_warmup: int,
     t_cool: int,
-    device: torch.device | None = None,
-    dtype: torch.dtype | None = torch.float32,
 ) -> Callable[[Tensor], Tensor]:
     """
     Implements cosine annealing learning rate scheduler mechanism. Its return
@@ -161,25 +199,40 @@ def cosine_annealing_lr_scheduler(
     It seems way better to use a closure to implement this, so that we
     don't have to pass fixed params eg min and max learning rate over and
     over when it is used.
+
+    To visualize the change of learning rate over # iterations:
+    ```
+    from cs336_basics.train import cosine_annealing_lr_scheduler
+    import matplotlib.pyplot as plt
+    import torch
+
+    lr_scheduler = cosine_annealing_lr_scheduler(
+                        lr_max=1e-1, lr_min=1e-3, t_warmup=100, t_cool=900)
+
+    iters = torch.arange(1, 1001).to(torch.float32)
+    lrs = [lr_scheduler(v) for v in iters]
+
+    fig, ax = plt.subplots()
+    ax.set_xlabel('# iterations')
+    ax.set_ylabel('learning rate')
+    ax.plot(iters.numpy(), lrs)
+    plt.show()
+    ```
     """
-    t_warmup_ = torch.tensor(t_warmup, device=device, dtype=dtype)
-    t_cool_ = torch.tensor(t_cool, device=device, dtype=dtype)
-    lr_max_ = torch.tensor(lr_max, device=device, dtype=dtype)
-    lr_min_ = torch.tensor(lr_min, device=device, dtype=dtype)
 
     def scheduler(t: Tensor) -> Tensor:
         """
         t: Current training run step represented by a scalar tensor.
         """
-        if t < t_warmup_:
-            return lr_max_.mul(t / t_warmup_)
-        elif t <= t_cool_:
+        if t < t_warmup:
+            return (t / t_warmup).mul_(lr_max)
+        elif t <= t_cool:
             cos_eff: Tensor = (
-                (t - t_warmup_).mul_(torch.pi).div_(t_cool_ - t_warmup_).cos_().add_(1)
+                (t - t_warmup).mul_(torch.pi).div_(t_cool - t_warmup).cos_().add_(1)
             )
-            return lr_min_.addcmul(cos_eff, (lr_max_ - lr_min_), value=0.5)
+            return cos_eff.mul_(lr_max - lr_min).mul_(0.5).add_(lr_min)
         else:
-            return lr_min_
+            return torch.tensor(lr_min, device=t.device, dtype=t.dtype)
 
     return scheduler
 
@@ -187,8 +240,6 @@ def cosine_annealing_lr_scheduler(
 def grad_clipper(
     max_norm: float,
     eps: float = 1e-6,
-    device: torch.device | None = None,
-    dtype: torch.dtype | None = torch.float32,
 ) -> Callable[[Iterable[nn.Parameter]], None]:
     """
     Creates logic to clip model parameters w/ given l2 norm.
@@ -236,11 +287,17 @@ def get_batch(
     batch_size: int,
     context_len: int,
     device: str,
+    rng: np.random.Generator | None = None,
 ) -> tuple[
-    Int[Tensor, "batch_size context_len"], Int[Tensor, "batch_size context_len"]
+    Int64[Tensor, "batch_size context_len"], Int64[Tensor, "batch_size context_len"]
 ]:
     """
     x: 1-d numpy array representing a single sequence of token IDs.
+    rng: RNG to produce predictable behavior for troubleshooting.
+
+    NOTE Pytorch currently only supports *some* numpy data types. E.g.
+    np.uint32 and np.uint16 are NOT supported hence a numpy array of these data
+    types cannot be loaded into a Pytorch tensor via `torch.from_numpy`.
 
     Spec:
         Sample sequences in the resulting batch w/ sliding window.
@@ -256,11 +313,17 @@ def get_batch(
         batch_size + context_len <= tokens_cnt
     ), f"Input size too small to collect {batch_size} token sequences of length {context_len}"
     in_seqs, nxt_tokens = [], []
-    # Turns out we have to sample sequences for the batch in random
+    # sample sequences for the batch in random
+    g = rng if rng is not None else _rng
     max_possible_start_idx = tokens_cnt - context_len - 1
-    for i in _rng.choice(max_possible_start_idx + 1, size=batch_size, replace=False):
-        in_seqs.append(torch.from_numpy(x[i : i + context_len]))
-        nxt_tokens.append(torch.from_numpy(x[i + 1 : i + 1 + context_len]))
+    # FIXME return the same batches to verify correctness of model's math
+    #for i in g.choice(max_possible_start_idx + 1, size=batch_size, replace=False):
+    for i in range(batch_size):
+        # copy numpy array into a data type supported by pytorch
+        in_seqs.append(torch.from_numpy(x[i : i + context_len].astype(np.int64)))
+        nxt_tokens.append(
+            torch.from_numpy(x[i + 1 : i + 1 + context_len].astype(np.int64))
+        )
 
     return (
         torch.stack(in_seqs, dim=0).to(device=device),
@@ -300,3 +363,136 @@ def load_checkpoint(
     optimizer.load_state_dict(state_dict_all["optimizer"])
 
     return state_dict_all["iteration"]
+
+
+def train_loop(
+    train_set: npt.NDArray,
+    validation_set: npt.NDArray,
+    batch_size: int,
+    vocab_size: int,
+    context_len: int,
+    num_layers: int,
+    d_model: int,
+    num_heads: int,
+    d_ff: int,
+    rope_theta: float,
+    t_max: int,
+    t_warmup: int,
+    t_cool: int,
+    lr_max: float,
+    lr_min: float,
+    grad_clip_max_norm: float,
+    checkpoint_src: str | os.PathLike | BinaryIO | IO[bytes] | None = None,
+    checkpoint_interval: int = 1000,
+    rand_seed: int | None = None,
+    device: str = "cpu",
+    dtype: torch.dtype | None = None,
+):
+    """
+    Args:
+        t_max: Max number of training iteratins to run.
+        t_warmup, t_cool: Iteration numbers marking the end of cosine annealling
+            learning rate scehdule warmup phase and annealing phase.
+        lr_max, lr_min: Max and min learning rate of cosine annealing schedule.
+        batch_size: Batch size of training data fed to model.
+        checkpoint_src: Checkpoint data to load w/ torch.load()
+        t_checkpoint: Iteration interval to checkpoint.
+        rand_seed: RNG seed for reproducible randomness behavior in debugging.
+
+    TODO:
+        [x] Test this w/ a very small Transformer model and try overfitting a
+            single batch of training data.
+        - Ability to profile CPU, RAM and accelerator usage
+            - e.g. https://docs.pytorch.org/docs/stable/autograd.html#profiler
+        - Ability to monitor and visualize training run progress
+        - Different strategies to sample sequences in a batch, include but not
+          limited to:
+            - Fixed: Always return the same batch of sequences.
+            - Given randomness: Sample w/ user-provided random seed
+            - (Default) System randomness: Sample w/ randomness available on the host
+    """
+    rng: np.random.Generator | None = None
+    if rand_seed is not None:
+        random.seed(rand_seed)
+        np.random.seed(rand_seed)
+        torch.manual_seed(rand_seed)
+        rng = np.random.default_rng(rand_seed)
+
+    model = TransformerModel(
+        vocab_size=vocab_size,
+        context_len=context_len,
+        num_layers=num_layers,
+        d_model=d_model,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        rope_theta=rope_theta,
+        device=torch.device(device),
+        dtype=dtype,
+    )
+    # optimize for efficiency when running model's tensor ops
+    # See https://docs.pytorch.org/docs/stable/generated/torch.compile.html#torch-compile
+    # Unfortunately as of Jan '26 Dynamo doesn't support Python3.12 :/
+    # TODO knob to turn this on/off
+    # model.compile()
+
+    lr_scheduler = cosine_annealing_lr_scheduler(
+        lr_max=lr_max, lr_min=lr_min, t_warmup=t_warmup, t_cool=t_cool
+    )
+    optimizer = AdamW(model.parameters(), lr=lr_max, lr_scheduler=lr_scheduler)
+    # TODO apply gradient clipping
+    # clip_grads = grad_clipper(max_norm=grad_clip_max_norm)
+
+    # training run
+    # TODO handle resume of training from given checkpoint
+    for t in range(1, t_max + 1):
+        # TODO refactor code below to run_train() and run_eval() respectively
+        # TODO for each training run, do we feed a single batch or multiple
+        # batches of training data to model? For now to examine the correctness
+        # of training loop impl and Transform model impl we will pass the same
+        # small batch of training data every time
+        # TODO collect the training loss and model evaluation metric for
+        # dashboarding
+        model.train()
+        # TODO expose knob to turn anomaly detection on/off
+        with autograd.set_detect_anomaly(False):
+            x, targets = get_batch(train_set, batch_size, context_len, device, rng)
+            # use model(...) instead of model.forward(...) as efficiency
+            # optimization eg torch.compile applies to the former.
+            # predictions in shape (batch_size context_len vocab_size)
+            predictions = model(x, normalize_output=False)
+            # NOTE Per cross-entropy fn math formula  it accounts
+            # for prediction/probability of token at each position of each sequence
+            # in the batch. So passing predictions and targets tensor w/
+            # sequence length dimension makes sense
+            loss = cross_entropy_loss(predictions, targets)
+            loss.backward()
+            # clip_grads(model.parameters())
+            optimizer.step()
+            optimizer.zero_grad()
+            # TODO configurable logging interval
+            if t % 10 == 0:
+                log.info(f"Epoch: {t} Training loss: {loss.item():7.3f}")
+
+        # evaluation w/ validation dataset
+        model.eval()
+        with torch.no_grad():
+            x_eval, targets_eval = get_batch(
+                validation_set, batch_size, context_len, device, rng
+            )
+            predictions_eval = model(x, normalize_output=False)
+            # TODO publish validation loss for dashboarding
+            loss_eval = cross_entropy_loss(predictions_eval, targets_eval)
+
+            if t % 10 == 0:
+                log.info(f"Epoch: {t} Validation loss: {loss_eval.item():7.3f}")
+                # perplexity scores of sequences in batch
+                ppl_batch = perplexity(predictions_eval, targets_eval).to(device="cpu")
+                ppl_min, ppl_median, ppl_max = (
+                    ppl_batch.min().item(),
+                    ppl_batch.median().item(),
+                    ppl_batch.max().item(),
+                )
+                log.info(
+                    f" Perplexity of sequences in batch - min: {ppl_min:7.3f} mid: {ppl_median:7.3f} max: {ppl_max:7.3f}"
+                )
+        # TODO save trained model data upon checkpointing / done all iterations
