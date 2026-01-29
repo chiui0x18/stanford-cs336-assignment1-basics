@@ -1,4 +1,7 @@
+import sys
+import time
 import random
+from pathlib import Path
 import numpy as np
 import numpy.typing as npt
 from collections.abc import Iterable, Callable
@@ -7,6 +10,7 @@ import os
 import torch
 from torch.optim import Optimizer
 from torch import Tensor, nn, linalg, autograd
+from torch.utils.tensorboard.writer import SummaryWriter
 from jaxtyping import Float, Int, Int64
 
 from cs336_basics.log import get_logger
@@ -251,7 +255,7 @@ def grad_clipper(
         in-place.
     """
 
-    @torch.no_grad
+    @torch.no_grad()
     def clip(params: Iterable[nn.Parameter]):
         """
         Spec:
@@ -317,7 +321,7 @@ def get_batch(
     g = rng if rng is not None else _rng
     max_possible_start_idx = tokens_cnt - context_len - 1
     # FIXME return the same batches to verify correctness of model's math
-    #for i in g.choice(max_possible_start_idx + 1, size=batch_size, replace=False):
+    # for i in g.choice(max_possible_start_idx + 1, size=batch_size, replace=False):
     for i in range(batch_size):
         # copy numpy array into a data type supported by pytorch
         in_seqs.append(torch.from_numpy(x[i : i + context_len].astype(np.int64)))
@@ -365,6 +369,7 @@ def load_checkpoint(
     return state_dict_all["iteration"]
 
 
+# TODO OO
 def train_loop(
     train_set: npt.NDArray,
     validation_set: npt.NDArray,
@@ -382,11 +387,14 @@ def train_loop(
     lr_max: float,
     lr_min: float,
     grad_clip_max_norm: float,
-    checkpoint_src: str | os.PathLike | BinaryIO | IO[bytes] | None = None,
+    checkpoint_src: Path | None = None,
     checkpoint_interval: int = 1000,
     rand_seed: int | None = None,
     device: str = "cpu",
     dtype: torch.dtype | None = None,
+    autograd_detect_anomaly: bool = False,
+    tensorboard_log_dir: str | None = None,
+    eval_interval: int = 50,
 ):
     """
     Args:
@@ -396,8 +404,14 @@ def train_loop(
         lr_max, lr_min: Max and min learning rate of cosine annealing schedule.
         batch_size: Batch size of training data fed to model.
         checkpoint_src: Checkpoint data to load w/ torch.load()
-        t_checkpoint: Iteration interval to checkpoint.
+        checkpoint_interval: Iteration interval to checkpoint. E.g. a value of
+            7 means performing checkpointing after completing every 7 iterations.
         rand_seed: RNG seed for reproducible randomness behavior in debugging.
+        autograd_detect_anomaly: Enable autograd anmaly detection. NOTE enable
+            this only for debugging as it can slow down training progress.
+        tensorboard_log_dir: Directory to output events for dashboarding w/
+            Tensorboard.
+        eval_interval: Iteration interval to evaluate model w/ validation dataset.
 
     TODO:
         [x] Test this w/ a very small Transformer model and try overfitting a
@@ -442,57 +456,86 @@ def train_loop(
     # TODO apply gradient clipping
     # clip_grads = grad_clipper(max_norm=grad_clip_max_norm)
 
-    # training run
+    summarizer = SummaryWriter(log_dir=tensorboard_log_dir)
+
+    log.info(
+        "Starting training run. Will evaluate trained model every"
+        f" {eval_interval} epochs"
+    )
     # TODO handle resume of training from given checkpoint
     for t in range(1, t_max + 1):
-        # TODO refactor code below to run_train() and run_eval() respectively
-        # TODO for each training run, do we feed a single batch or multiple
-        # batches of training data to model? For now to examine the correctness
-        # of training loop impl and Transform model impl we will pass the same
-        # small batch of training data every time
-        # TODO collect the training loss and model evaluation metric for
-        # dashboarding
+        # TODO refactor code below to run_train()
+        # Use 1 batch of training data per run instead of multiple batches.
+        # Latter leads to unnecessary accumulation of gradient and will mess up
+        # backprop.
+        # > The loss will be computed over a sampled batch of data
         model.train()
-        # TODO expose knob to turn anomaly detection on/off
-        with autograd.set_detect_anomaly(False):
+        with autograd.set_detect_anomaly(autograd_detect_anomaly):
             x, targets = get_batch(train_set, batch_size, context_len, device, rng)
             # use model(...) instead of model.forward(...) as efficiency
             # optimization eg torch.compile applies to the former.
             # predictions in shape (batch_size context_len vocab_size)
             predictions = model(x, normalize_output=False)
-            # NOTE Per cross-entropy fn math formula  it accounts
+            # NOTE Per cross-entropy fn math formula it accounts
             # for prediction/probability of token at each position of each sequence
             # in the batch. So passing predictions and targets tensor w/
             # sequence length dimension makes sense
             loss = cross_entropy_loss(predictions, targets)
             loss.backward()
-            # clip_grads(model.parameters())
+            # TODO clip_grads(model.parameters())
             optimizer.step()
             optimizer.zero_grad()
-            # TODO configurable logging interval
-            if t % 10 == 0:
-                log.info(f"Epoch: {t} Training loss: {loss.item():7.3f}")
 
         # evaluation w/ validation dataset
-        model.eval()
-        with torch.no_grad():
+        if t % eval_interval == 0:
+            summarizer.add_scalar(
+                "Loss/train", loss.item(), t, time.time(), new_style=True
+            )
             x_eval, targets_eval = get_batch(
                 validation_set, batch_size, context_len, device, rng
             )
-            predictions_eval = model(x, normalize_output=False)
-            # TODO publish validation loss for dashboarding
-            loss_eval = cross_entropy_loss(predictions_eval, targets_eval)
+            run_eval(model, x_eval, targets_eval, summarizer, t)
 
-            if t % 10 == 0:
-                log.info(f"Epoch: {t} Validation loss: {loss_eval.item():7.3f}")
-                # perplexity scores of sequences in batch
-                ppl_batch = perplexity(predictions_eval, targets_eval).to(device="cpu")
-                ppl_min, ppl_median, ppl_max = (
-                    ppl_batch.min().item(),
-                    ppl_batch.median().item(),
-                    ppl_batch.max().item(),
-                )
-                log.info(
-                    f" Perplexity of sequences in batch - min: {ppl_min:7.3f} mid: {ppl_median:7.3f} max: {ppl_max:7.3f}"
-                )
+        summarizer.flush()
+        summarizer.close()
         # TODO save trained model data upon checkpointing / done all iterations
+
+
+@torch.no_grad()
+def run_eval(
+    model: TransformerModel,
+    x: Int64[Tensor, "batch_size context_len"],
+    targets: Int64[Tensor, "batch_size context_len"],
+    summarizer: SummaryWriter,
+    step: int,
+):
+    '''
+    x: Batched token sequences from validation set.
+    targets: Batched next tokens from validation set.
+    step: Global training loop step number.
+    '''
+    model.eval()
+    preds = model(x, normalize_output=False)
+    loss = cross_entropy_loss(preds, targets)
+
+    # perplexity scores of sequences in batch
+    ppl_batch = perplexity(preds, targets)
+    # Use log-perplexity for dashboarding
+    lp_min, lp_median, lp_max = (
+        ppl_batch.min().log_().item(),
+        ppl_batch.median().log_().item(),
+        ppl_batch.max().log_().item(),
+    )
+
+    now = time.time()
+    summarizer.add_scalar("Loss/eval", loss.item(), step, now, new_style=True)
+    summarizer.add_scalars(
+        "EvalLogPerplexity",
+        {
+            "min": lp_min,
+            "median": lp_median,
+            "max": lp_max,
+        },
+        step,
+        now,
+    )

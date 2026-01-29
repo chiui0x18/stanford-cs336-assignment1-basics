@@ -20,7 +20,7 @@ def get_logger(name: str, level=logging.DEBUG) -> logging.Logger:
     # Avoid affecting other loggers / root logger
     logger.propagate = False
 
-    # Create handler (here: stdout)
+    # Create handler (here: stderr)
     handler: logging.Handler = logging.StreamHandler()
 
     # Format: logger name, time, PID, TID, level, message
