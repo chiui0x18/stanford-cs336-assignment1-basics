@@ -363,16 +363,30 @@ def _flush_to_disk(
     help="L2 norm threshold to apply gradient clipping",
 )
 @click.option(
-    "--checkpoint-src",
+    "--from-checkpoint",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     default=None,
-    help="Path to model checkpoint TODO handle resume of training from checkpoint",
+    help="Path to a checkpointed model which training run will resume on",
+)
+@click.option(
+    "--checkpoint-dir",
+    type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path),
+    default=None,
+    help="Directory to save model checkpoints. Use hierarchical path pattern eg"
+    " `./checkpoints/run-my-comments/`. Model checkpoint files will have name"
+    " pattern `{run_epoch_num}.pt`",
 )
 @click.option(
     "--checkpoint-interval",
     type=click.INT,
     default=None,
     help="Interval, in # epochs, to checkpoint model training progress",
+)
+@click.option(
+    "--eval-interval",
+    type=click.INT,
+    default=50,
+    help="Interval, in # epochs, to evaluate trained model w/ validation dataset",
 )
 @click.option(
     "--rand-seed",
@@ -394,6 +408,19 @@ def _flush_to_disk(
     default="float32",
     help="data type used for tensor representation and operations",
 )
+@click.option(
+    "--log-dir",
+    type=click.STRING,
+    default=None,
+    help="Path to directory to save Tensorboard event files for monitoring and"
+    " dashboarding. Default to ./runs/CURRENT_DATETIME_HOSTNAME which changes per"
+    "training run. To make comparison between runs easy, use hierarchical structure",
+)
+@click.option(
+    "--autograd-detect-anomaly",
+    is_flag=True,
+    help="Enable Pytorch autograd anomaly detection. Use it only for debug",
+)
 def cli_train(
     training_data,
     validation_data,
@@ -411,17 +438,26 @@ def cli_train(
     lr_max: float,
     lr_min: float,
     grad_clip_norm: float,
-    checkpoint_src: Path,
+    from_checkpoint: Path,
+    checkpoint_dir: Path,
     checkpoint_interval: int,
+    eval_interval: int,
     rand_seed: int,
     device: str,
     dtype: str,
+    log_dir: str | None,
+    autograd_detect_anomaly: bool,
 ):
     """
     Run training loop for Transformer model of given spec.
 
     TODO Argument for file path to save training checkpoints including the
     final trained model data.
+
+
+    autograd_detect_anomaly: bool = False,
+    tensorboard_log_dir: str | None = None,
+    eval_interval: int = 50,
     """
     torch_dtype: torch.dtype = torch.float32
     # TODO support other data types
@@ -450,11 +486,15 @@ def cli_train(
         lr_max=lr_max,
         lr_min=lr_min,
         grad_clip_max_norm=grad_clip_norm,
-        checkpoint_src=checkpoint_src,
+        from_checkpoint=from_checkpoint,
+        checkpoint_dir=checkpoint_dir,
         checkpoint_interval=checkpoint_interval,
         rand_seed=rand_seed,
         device=device,
         dtype=torch_dtype,
+        tensorboard_log_dir=log_dir,
+        eval_interval=eval_interval,
+        autograd_detect_anomaly=autograd_detect_anomaly,
     )
 
 

@@ -387,7 +387,8 @@ def train_loop(
     lr_max: float,
     lr_min: float,
     grad_clip_max_norm: float,
-    checkpoint_src: Path | None = None,
+    from_checkpoint: Path | None = None,
+    checkpoint_dir: Path | None = None,
     checkpoint_interval: int = 1000,
     rand_seed: int | None = None,
     device: str = "cpu",
@@ -403,7 +404,11 @@ def train_loop(
             learning rate scehdule warmup phase and annealing phase.
         lr_max, lr_min: Max and min learning rate of cosine annealing schedule.
         batch_size: Batch size of training data fed to model.
-        checkpoint_src: Checkpoint data to load w/ torch.load()
+        from_checkpoint: Path to the checkpointed model to load. Training run
+            will resume from this checkpoint instead of starting from scratch.
+        checkpoint_dir: Directory to checkpoint partially trained model. Prefer
+            using hierarchical path eg ./checkpoints/my-run-with-cfg-xyz/
+            Checkpoint files will have name pattern `{run_epoch_num}.pt`
         checkpoint_interval: Iteration interval to checkpoint. E.g. a value of
             7 means performing checkpointing after completing every 7 iterations.
         rand_seed: RNG seed for reproducible randomness behavior in debugging.
@@ -453,17 +458,22 @@ def train_loop(
         lr_max=lr_max, lr_min=lr_min, t_warmup=t_warmup, t_cool=t_cool
     )
     optimizer = AdamW(model.parameters(), lr=lr_max, lr_scheduler=lr_scheduler)
+
+    t_start = 1
+    # Load checkpointed model if given
+    if from_checkpoint is not None:
+        t_start = load_checkpoint(from_checkpoint, model, optimizer) + 1
     # TODO apply gradient clipping
     # clip_grads = grad_clipper(max_norm=grad_clip_max_norm)
 
     summarizer = SummaryWriter(log_dir=tensorboard_log_dir)
 
     log.info(
-        "Starting training run. Will evaluate trained model every"
+        f"Starting training run from epoch {t_start} to {t_max}. Will evaluate trained model every"
         f" {eval_interval} epochs"
     )
     # TODO handle resume of training from given checkpoint
-    for t in range(1, t_max + 1):
+    for t in range(t_start, t_max + 1):
         # TODO refactor code below to run_train()
         # Use 1 batch of training data per run instead of multiple batches.
         # Latter leads to unnecessary accumulation of gradient and will mess up
@@ -496,9 +506,17 @@ def train_loop(
             )
             run_eval(model, x_eval, targets_eval, summarizer, t)
 
+        # TODO save the model upon exhausting all epochs?
+        if t % checkpoint_interval == 0 and checkpoint_dir is not None:
+            time_checkpoint_start = time.time()
+            checkpoint_fp = checkpoint_dir / f"{t}.pt"
+            save_checkpoint(model, optimizer, t, checkpoint_fp)
+            log.info(
+                f"Checkpointed model at end of epoch {t:>7d}. Took {time.time()-time_checkpoint_start:>4.2f}s"
+            )
+
         summarizer.flush()
         summarizer.close()
-        # TODO save trained model data upon checkpointing / done all iterations
 
 
 @torch.no_grad()
@@ -509,11 +527,11 @@ def run_eval(
     summarizer: SummaryWriter,
     step: int,
 ):
-    '''
+    """
     x: Batched token sequences from validation set.
     targets: Batched next tokens from validation set.
     step: Global training loop step number.
-    '''
+    """
     model.eval()
     preds = model(x, normalize_output=False)
     loss = cross_entropy_loss(preds, targets)

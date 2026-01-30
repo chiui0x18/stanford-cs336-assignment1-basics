@@ -28,6 +28,7 @@ dependencies = [
     "jupyterlab>=4.5.1",
     "click>=8.2.1",
     "matplotlib>=3.10.8",
+    "tensorboard>=2.20.0",
 ]
 
 [build-system]
