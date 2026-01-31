@@ -1,4 +1,4 @@
-import time
+from datetime import datetime
 import pickle
 import json
 from pathlib import Path
@@ -370,7 +370,7 @@ def _flush_to_disk(
 )
 @click.option(
     "--checkpoint-dir",
-    type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path),
+    type=click.Path(exists=False, dir_okay=True, file_okay=False, path_type=Path),
     default=None,
     help="Directory to save model checkpoints. Use hierarchical path pattern eg"
     " `./checkpoints/run-my-comments/`. Model checkpoint files will have name"
@@ -381,6 +381,13 @@ def _flush_to_disk(
     type=click.INT,
     default=None,
     help="Interval, in # epochs, to checkpoint model training progress",
+)
+@click.option(
+    "--metric-interval",
+    type=click.INT,
+    default=20,
+    help="Interval, in # epochs, to metric training loss. To facilitate "
+    "comparison b/w training and eval loss, it shall divide eval interval value",
 )
 @click.option(
     "--eval-interval",
@@ -410,11 +417,12 @@ def _flush_to_disk(
 )
 @click.option(
     "--log-dir",
-    type=click.STRING,
-    default=None,
+    type=click.Path(exists=False, dir_okay=True, file_okay=False, path_type=Path),
+    required=True,
     help="Path to directory to save Tensorboard event files for monitoring and"
-    " dashboarding. Default to ./runs/CURRENT_DATETIME_HOSTNAME which changes per"
-    "training run. To make comparison between runs easy, use hierarchical structure",
+    " dashboarding. Vary this by training run unless resuming from checkpoint"
+    " in a particular run. To facilitate comparison between runs, use"
+    " hierarchical path structure eg ./runs/paramName1Val1_etc_etc",
 )
 @click.option(
     "--autograd-detect-anomaly",
@@ -441,11 +449,12 @@ def cli_train(
     from_checkpoint: Path,
     checkpoint_dir: Path,
     checkpoint_interval: int,
+    metric_interval: int,
     eval_interval: int,
     rand_seed: int,
     device: str,
     dtype: str,
-    log_dir: str | None,
+    log_dir: Path,
     autograd_detect_anomaly: bool,
 ):
     """
@@ -459,6 +468,14 @@ def cli_train(
     tensorboard_log_dir: str | None = None,
     eval_interval: int = 50,
     """
+    cli_args = locals()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    # Save CLI argument values for bookkeeping purpose
+    with open(log_dir / "cli.args.json", "w") as f:
+        json.dump(cli_args, f, default=str, indent=2)
+    if checkpoint_dir is not None:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
     torch_dtype: torch.dtype = torch.float32
     # TODO support other data types
     match dtype:
@@ -466,9 +483,12 @@ def cli_train(
             torch_dtype = torch.bfloat16
         case "float16":
             torch_dtype = torch.float16
+        case _:
+            pass
 
     train_set = np.memmap(training_data, dtype=np.uint32, mode="r")
     valid_set = np.memmap(validation_data, dtype=np.uint32, mode="r")
+    start = datetime.now()
     train_loop(
         train_set=train_set,
         validation_set=valid_set,
@@ -495,7 +515,10 @@ def cli_train(
         tensorboard_log_dir=log_dir,
         eval_interval=eval_interval,
         autograd_detect_anomaly=autograd_detect_anomaly,
+        metric_interval=metric_interval,
     )
+    d_train = datetime.now() - start
+    log.info(f"Training run took {d_train}")
 
 
 if __name__ == "__main__":

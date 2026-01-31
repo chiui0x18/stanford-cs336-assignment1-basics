@@ -320,9 +320,9 @@ def get_batch(
     # sample sequences for the batch in random
     g = rng if rng is not None else _rng
     max_possible_start_idx = tokens_cnt - context_len - 1
+    for i in g.choice(max_possible_start_idx + 1, size=batch_size, replace=False):
     # FIXME return the same batches to verify correctness of model's math
-    # for i in g.choice(max_possible_start_idx + 1, size=batch_size, replace=False):
-    for i in range(batch_size):
+    #for i in range(batch_size):
         # copy numpy array into a data type supported by pytorch
         in_seqs.append(torch.from_numpy(x[i : i + context_len].astype(np.int64)))
         nxt_tokens.append(
@@ -394,9 +394,10 @@ def train_loop(
     device: str = "cpu",
     dtype: torch.dtype | None = None,
     autograd_detect_anomaly: bool = False,
-    tensorboard_log_dir: str | None = None,
+    tensorboard_log_dir: Path | None = None,
     eval_interval: int = 50,
-):
+    metric_interval: int = 10,
+) -> None:
     """
     Args:
         t_max: Max number of training iteratins to run.
@@ -417,6 +418,8 @@ def train_loop(
         tensorboard_log_dir: Directory to output events for dashboarding w/
             Tensorboard.
         eval_interval: Iteration interval to evaluate model w/ validation dataset.
+        metric_interval: Iteration interval to metric training loss.
+            It shall divide eval_interval.
 
     TODO:
         [x] Test this w/ a very small Transformer model and try overfitting a
@@ -451,8 +454,12 @@ def train_loop(
     # optimize for efficiency when running model's tensor ops
     # See https://docs.pytorch.org/docs/stable/generated/torch.compile.html#torch-compile
     # Unfortunately as of Jan '26 Dynamo doesn't support Python3.12 :/
+    # > Compilation with Inductor is not supported on mps as of torch version 2.6.0.
     # TODO knob to turn this on/off
-    # model.compile()
+    torch_compiler_backend = "inductor"
+    if device == "mps" and torch.__version__ == "2.6.0":
+        torch_compiler_backend = "aot_eager"
+    model.compile(backend=torch_compiler_backend)
 
     lr_scheduler = cosine_annealing_lr_scheduler(
         lr_max=lr_max, lr_min=lr_min, t_warmup=t_warmup, t_cool=t_cool
@@ -466,12 +473,9 @@ def train_loop(
     # TODO apply gradient clipping
     # clip_grads = grad_clipper(max_norm=grad_clip_max_norm)
 
-    summarizer = SummaryWriter(log_dir=tensorboard_log_dir)
+    summarizer = SummaryWriter(log_dir=str(tensorboard_log_dir))
 
-    log.info(
-        f"Starting training run from epoch {t_start} to {t_max}. Will evaluate trained model every"
-        f" {eval_interval} epochs"
-    )
+    log.info(f"Starting training run from epoch {t_start} to {t_max}")
     # TODO handle resume of training from given checkpoint
     for t in range(t_start, t_max + 1):
         # TODO refactor code below to run_train()
@@ -496,18 +500,19 @@ def train_loop(
             optimizer.step()
             optimizer.zero_grad()
 
+        # metric training loss
+        if t % metric_interval == 0:
+            summarizer.add_scalars("Loss", {"train": loss.item()}, t, time.time())
+
         # evaluation w/ validation dataset
         if t % eval_interval == 0:
-            summarizer.add_scalar(
-                "Loss/train", loss.item(), t, time.time(), new_style=True
-            )
             x_eval, targets_eval = get_batch(
                 validation_set, batch_size, context_len, device, rng
             )
             run_eval(model, x_eval, targets_eval, summarizer, t)
 
         # TODO save the model upon exhausting all epochs?
-        if t % checkpoint_interval == 0 and checkpoint_dir is not None:
+        if checkpoint_dir is not None and t % checkpoint_interval == 0:
             time_checkpoint_start = time.time()
             checkpoint_fp = checkpoint_dir / f"{t}.pt"
             save_checkpoint(model, optimizer, t, checkpoint_fp)
@@ -546,7 +551,7 @@ def run_eval(
     )
 
     now = time.time()
-    summarizer.add_scalar("Loss/eval", loss.item(), step, now, new_style=True)
+    summarizer.add_scalars("Loss", {"eval": loss.item()}, step, now)
     summarizer.add_scalars(
         "EvalLogPerplexity",
         {
