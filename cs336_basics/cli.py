@@ -347,13 +347,13 @@ def _flush_to_disk(
 @click.option(
     "--lr-max",
     type=click.FLOAT,
-    default=1e-2,
+    default=1e-3,
     help="Max learning rate per cos annealling schedule",
 )
 @click.option(
     "--lr-min",
     type=click.FLOAT,
-    default=5e-4,
+    default=1e-4,
     help="Min learning rate per cos annealling schedule",
 )
 @click.option(
@@ -427,7 +427,12 @@ def _flush_to_disk(
 @click.option(
     "--autograd-detect-anomaly",
     is_flag=True,
-    help="Enable Pytorch autograd anomaly detection. Use it only for debug",
+    help="Enable Pytorch autograd anomaly detection. For debug only",
+)
+@click.option(
+    "--metric-grad-norm",
+    is_flag=True,
+    help="Compute and metric model param gradient L2 norm. For debug only",
 )
 def cli_train(
     training_data,
@@ -456,6 +461,7 @@ def cli_train(
     dtype: str,
     log_dir: Path,
     autograd_detect_anomaly: bool,
+    metric_grad_norm: bool,
 ):
     """
     Run training loop for Transformer model of given spec.
@@ -516,6 +522,7 @@ def cli_train(
         eval_interval=eval_interval,
         autograd_detect_anomaly=autograd_detect_anomaly,
         metric_interval=metric_interval,
+        metric_grad_norm=metric_grad_norm,
     )
     d_train = datetime.now() - start
     log.info(f"Training run took {d_train}")

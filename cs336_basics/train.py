@@ -321,8 +321,8 @@ def get_batch(
     g = rng if rng is not None else _rng
     max_possible_start_idx = tokens_cnt - context_len - 1
     for i in g.choice(max_possible_start_idx + 1, size=batch_size, replace=False):
-    # FIXME return the same batches to verify correctness of model's math
-    #for i in range(batch_size):
+        # FIXME return the same batches to verify correctness of model's math
+        # for i in range(batch_size):
         # copy numpy array into a data type supported by pytorch
         in_seqs.append(torch.from_numpy(x[i : i + context_len].astype(np.int64)))
         nxt_tokens.append(
@@ -397,6 +397,7 @@ def train_loop(
     tensorboard_log_dir: Path | None = None,
     eval_interval: int = 50,
     metric_interval: int = 10,
+    metric_grad_norm: bool = False,
 ) -> None:
     """
     Args:
@@ -413,13 +414,15 @@ def train_loop(
         checkpoint_interval: Iteration interval to checkpoint. E.g. a value of
             7 means performing checkpointing after completing every 7 iterations.
         rand_seed: RNG seed for reproducible randomness behavior in debugging.
-        autograd_detect_anomaly: Enable autograd anmaly detection. NOTE enable
-            this only for debugging as it can slow down training progress.
+        autograd_detect_anomaly: Enable autograd anmaly detection. NOTE this is
+            for debug only as it can slow down training progress.
         tensorboard_log_dir: Directory to output events for dashboarding w/
             Tensorboard.
         eval_interval: Iteration interval to evaluate model w/ validation dataset.
         metric_interval: Iteration interval to metric training loss.
             It shall divide eval_interval.
+        metric_grad_norm: Compute and metric model parameter gradient L2 norm.
+            Can slow down training. For debug only.
 
     TODO:
         [x] Test this w/ a very small Transformer model and try overfitting a
@@ -470,14 +473,19 @@ def train_loop(
     # Load checkpointed model if given
     if from_checkpoint is not None:
         t_start = load_checkpoint(from_checkpoint, model, optimizer) + 1
-    # TODO apply gradient clipping
-    # clip_grads = grad_clipper(max_norm=grad_clip_max_norm)
+    # apply gradient clipping
+    clip_grads = None
+    if grad_clip_max_norm is not None:
+        clip_grads = grad_clipper(max_norm=grad_clip_max_norm)
 
     summarizer = SummaryWriter(log_dir=str(tensorboard_log_dir))
 
     log.info(f"Starting training run from epoch {t_start} to {t_max}")
     # TODO handle resume of training from given checkpoint
     for t in range(t_start, t_max + 1):
+        should_metric = t % metric_interval == 0
+        should_eval = t % eval_interval == 0
+        should_checkpoint = checkpoint_dir is not None and t % checkpoint_interval == 0
         # TODO refactor code below to run_train()
         # Use 1 batch of training data per run instead of multiple batches.
         # Latter leads to unnecessary accumulation of gradient and will mess up
@@ -496,23 +504,36 @@ def train_loop(
             # sequence length dimension makes sense
             loss = cross_entropy_loss(predictions, targets)
             loss.backward()
-            # TODO clip_grads(model.parameters())
+
+            if clip_grads is not None:
+                clip_grads(model.parameters())
+
+            if metric_grad_norm and should_metric:
+                with torch.no_grad():
+                    grads = [p.grad for p in model.parameters() if p.grad is not None]
+                    grad_l2_norm = linalg.vector_norm(
+                        torch.stack(torch._foreach_norm(grads, ord=2)), ord=2
+                    )
+                summarizer.add_scalar(
+                    "GradL2Norm", grad_l2_norm.item(), t, time.time(), new_style=True
+                )
+
             optimizer.step()
             optimizer.zero_grad()
 
         # metric training loss
-        if t % metric_interval == 0:
+        if should_metric:
             summarizer.add_scalars("Loss", {"train": loss.item()}, t, time.time())
 
         # evaluation w/ validation dataset
-        if t % eval_interval == 0:
+        if should_eval:
             x_eval, targets_eval = get_batch(
                 validation_set, batch_size, context_len, device, rng
             )
             run_eval(model, x_eval, targets_eval, summarizer, t)
 
         # TODO save the model upon exhausting all epochs?
-        if checkpoint_dir is not None and t % checkpoint_interval == 0:
+        if should_checkpoint:
             time_checkpoint_start = time.time()
             checkpoint_fp = checkpoint_dir / f"{t}.pt"
             save_checkpoint(model, optimizer, t, checkpoint_fp)
