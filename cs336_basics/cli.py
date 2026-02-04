@@ -326,6 +326,13 @@ def _flush_to_disk(
     "--theta", type=click.FLOAT, default=10000, help="Value of theta for RoPE"
 )
 @click.option(
+    "--lr",
+    type=click.FLOAT,
+    default=None,
+    help="AdamW optimizer initial learning rate. NOTE this will use the optimizer's "
+         "internal learning rate scheduler instead of cosine annealling",
+)
+@click.option(
     "--tmax",
     type=click.INT,
     required=True,
@@ -355,6 +362,12 @@ def _flush_to_disk(
     type=click.FLOAT,
     default=1e-4,
     help="Min learning rate per cos annealling schedule",
+)
+@click.option(
+    "--weight-decay",
+    type=click.FLOAT,
+    default=0.01,
+    help="AdamW optimizer weight decay factor. See https://arxiv.org/pdf/1711.05101",
 )
 @click.option(
     "--grad-clip-norm",
@@ -445,11 +458,13 @@ def cli_train(
     heads: int,
     d_ff: int,
     theta: float,
+    lr: float,
     tmax: int,
     twarmup: int,
     tcool: int,
     lr_max: float,
     lr_min: float,
+    weight_decay: float,
     grad_clip_norm: float,
     from_checkpoint: Path,
     checkpoint_dir: Path,
@@ -506,6 +521,7 @@ def cli_train(
         num_heads=heads,
         d_ff=d_ff,
         rope_theta=theta,
+        lr=lr,
         t_max=tmax,
         t_warmup=twarmup,
         t_cool=tcool,
@@ -523,6 +539,7 @@ def cli_train(
         autograd_detect_anomaly=autograd_detect_anomaly,
         metric_interval=metric_interval,
         metric_grad_norm=metric_grad_norm,
+        weight_decay=weight_decay,
     )
     d_train = datetime.now() - start
     log.info(f"Training run took {d_train}")

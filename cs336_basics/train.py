@@ -381,12 +381,13 @@ def train_loop(
     num_heads: int,
     d_ff: int,
     rope_theta: float,
+    lr: float | None,
     t_max: int,
-    t_warmup: int,
-    t_cool: int,
-    lr_max: float,
-    lr_min: float,
-    grad_clip_max_norm: float,
+    t_warmup: int | None,
+    t_cool: int | None,
+    lr_max: float | None,
+    lr_min: float | None,
+    grad_clip_max_norm: float | None,
     from_checkpoint: Path | None = None,
     checkpoint_dir: Path | None = None,
     checkpoint_interval: int = 1000,
@@ -398,9 +399,13 @@ def train_loop(
     eval_interval: int = 50,
     metric_interval: int = 10,
     metric_grad_norm: bool = False,
+    weight_decay: float | None = 0.01,
 ) -> None:
     """
     Args:
+        lr: Initial learning rate for AdamW optimizer. This assumes we use the
+            optimizer's internal scheduling instead of cosine annealling
+            lr scheduler.
         t_max: Max number of training iteratins to run.
         t_warmup, t_cool: Iteration numbers marking the end of cosine annealling
             learning rate scehdule warmup phase and annealing phase.
@@ -423,6 +428,8 @@ def train_loop(
             It shall divide eval_interval.
         metric_grad_norm: Compute and metric model parameter gradient L2 norm.
             Can slow down training. For debug only.
+        weight_decay: Weight decay hyperparameter for AdamW.
+        TODO: Expose betas as well.
 
     TODO:
         [x] Test this w/ a very small Transformer model and try overfitting a
@@ -467,7 +474,9 @@ def train_loop(
     lr_scheduler = cosine_annealing_lr_scheduler(
         lr_max=lr_max, lr_min=lr_min, t_warmup=t_warmup, t_cool=t_cool
     )
-    optimizer = AdamW(model.parameters(), lr=lr_max, lr_scheduler=lr_scheduler)
+    optimizer = AdamW(model.parameters(),
+                      lr=lr_max, lr_scheduler=lr_scheduler,
+                      weight_decay=weight_decay)
 
     t_start = 1
     # Load checkpointed model if given
