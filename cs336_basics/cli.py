@@ -1,3 +1,4 @@
+import time
 from datetime import datetime
 import pickle
 import json
@@ -11,7 +12,6 @@ from cs336_basics.pretokenizer import pretokenize
 from cs336_basics.bpe import UTF8, train_bpe, Tokenizer
 from cs336_basics.log import get_logger
 from cs336_basics.train import train_loop
-
 
 log = get_logger("cli")
 
@@ -330,7 +330,7 @@ def _flush_to_disk(
     type=click.FLOAT,
     default=None,
     help="AdamW optimizer initial learning rate. NOTE this will use the optimizer's "
-         "internal learning rate scheduler instead of cosine annealling",
+    "internal learning rate scheduler instead of cosine annealling",
 )
 @click.option(
     "--tmax",

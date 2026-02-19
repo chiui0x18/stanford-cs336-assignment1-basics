@@ -361,13 +361,15 @@ class RotaryPositionalEmbedding(nn.Module):
 
 
 def softmax(x: torch.Tensor, i: int) -> torch.Tensor:
-    """
+    """Home-made softmax. NOTE it entails poor compute performance
+    even though its math is correct. Use Pytorch's softmax instead.
+
     x: Multi-dimensional tensor.
     i: The i-th dimension of x (For now assume the index is 0-based)
     return: Tensor of same shape as x, w/ values at i-th dimension turn into
         normalized probabilities under softmax.
 
-    Can refer to the behavior of std pytorch lib softmax function.
+    Impl refers to the behavior of std pytorch lib softmax function.
     """
     assert (
         -x.ndim <= i < x.ndim
@@ -687,22 +689,20 @@ class TransformerModel(nn.Module):
     def forward(
         self,
         x: Int[Tensor, "batch_size seq_len"],
-        normalize_output: bool | None = True,
+        normalize_output: bool | None = False,
     ) -> Float[Tensor, "batch_size seq_len vocab_size"]:
         """
         x: Batch of token ID sequences, of shape (batch_size, seq_len)
-        normalize_output: Normalize transformer model output w/ softmax.
-            Default to true. Add this flag as UT demands unnormalized output,
-            which IMO is to avoid issue in comparison of super small numbers
-            which is deemed to be inaccurate due to the use of representation
-            w/ limited bitwidth.
-        return: Batched normalized probability distribution over given token
-            vocabulary, of shape (batch_size, seq_len, vocab_size), where the
+        normalize_output: Normalize transformer model output (raw predicted
+            next-token logits) w/ softmax. Default to false as a convention in .
+        return: Batched raw predicted next-token logits, aka **unormalized**
+            probability distribution over the given token vocabulary, of shape
+            (batch_size, seq_len, vocab_size), where the
             predicted distribution is over the next word for each input token.
             Specifically, the value at index [i, j, k] of this resultant tensor
-            represents the probability that the next token of the j-th token
-            in the i-th sequence of the given batch (aka x) is token w/ ID k.
-            (i, j, k are all 0-based)
+            represents the unormalized probability that the next token of the
+            j-th token in the i-th sequence of the given batch (aka x) is the
+            token w/ ID k. i, j, k are all 0-based.
 
         For more see assignment handout section 3, page 14.
         """
@@ -712,11 +712,10 @@ class TransformerModel(nn.Module):
         x = self.token_embedding(x)
         for t in self.transformer_blocks:
             x = t(x, token_positions)
-        x = self.norm_post_transformer_blocks(x)
-        if normalize_output:
-            return softmax(self.output_embedding(x), i=-1)
-        else:
-            return self.output_embedding(x)
+        x = self.output_embedding(self.norm_post_transformer_blocks(x))
+        if not normalize_output:
+            return x
+        return softmax(x, i=-1)
 
 
 ###############################################################################

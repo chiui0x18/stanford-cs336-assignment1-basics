@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import BinaryIO
 import regex as re
 
-
 # for GPT-2
 PRE_TOKENIZE_PAT = re.compile(
     r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""

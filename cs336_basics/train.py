@@ -1,17 +1,18 @@
-import sys
 import time
 import random
 from pathlib import Path
+import json
 import numpy as np
 import numpy.typing as npt
-from collections.abc import Iterable, Callable
+from collections.abc import Iterable, Callable, Iterator
 from typing import BinaryIO, IO
 import os
 import torch
+import torch._dynamo
 from torch.optim import Optimizer
 from torch import Tensor, nn, linalg, autograd
 from torch.utils.tensorboard.writer import SummaryWriter
-from jaxtyping import Float, Int, Int64
+from jaxtyping import Float, Int64
 
 from cs336_basics.log import get_logger
 from cs336_basics.transformer import TransformerModel
@@ -111,10 +112,14 @@ class AdamW(Optimizer):
         eps: float = 1e-8,
         weight_decay: float = 1e-2,
         lr_scheduler: Callable[[Tensor], Tensor] | None = None,
+        wd_scheduler: Callable[[Tensor], Tensor] | None = None,
     ) -> None:
         """
         lr: learning rate
         weight_decay: weight decay rate
+        lr_scheduler: learning rate scheduler, aka a function that computes the learning rate to use at training run epoch t.
+            IMO closure is the best impl for such schedulers.
+        wd_scheduler: weight decay rate scheduler.
         """
         defaults = {
             "lr": lr,
@@ -125,6 +130,7 @@ class AdamW(Optimizer):
         }
         super().__init__(params, defaults)
         self.lr_scheduler = lr_scheduler
+        self.wd_scheduler = wd_scheduler
 
     def step(self, closure: Callable[[], float] | None = None) -> float | None:
         """
@@ -150,7 +156,7 @@ class AdamW(Optimizer):
 
                 state = self.state[p]
                 if len(state) == 0:
-                    state["t"] = torch.tensor(1, dtype=p.dtype)
+                    state["t"] = torch.tensor(1, device=p.device, dtype=torch.float32)
                     state["m"] = torch.zeros_like(
                         p, memory_format=torch.preserve_format
                     )
@@ -170,14 +176,22 @@ class AdamW(Optimizer):
                     # due to creation of intermediate tensors
                     m.mul_(beta1).add_(grad, alpha=1 - beta1)
                     v.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
-                    # Apply weight decay first; See spec in Pytorch doc
-                    p.mul_(1 - lr * weight_decay)
                     # Compute lr w/ scheduler if present
                     if self.lr_scheduler is not None:
                         lr_t = self.lr_scheduler(t)
                     else:
                         lr_t = lr * torch.sqrt(1 - beta2**t) / (1 - beta1**t)
-                    # descent
+
+                    if self.wd_scheduler is not None:
+                        wd_t = self.wd_scheduler(t)
+                    else:
+                        wd_t = weight_decay
+                    # Apply decoupled weight decay then descent.
+                    # Apply weight decay first; Note this aligns w/ the
+                    # algo 2 in the original AdamW paper (See https://arxiv.org/pdf/1711.05101) and spec in Pytorch doc
+                    # For now we use the same formula with assignment aka scaling weight decay rate by factor of initial lr.
+                    # NOTE a different way per the original paper is scaling weight decay rate by factor of current-step lr.
+                    p.mul_(1 - lr * wd_t)
                     p.addcdiv_(m, torch.sqrt(v).add_(eps), value=-lr_t)
 
                 t.add_(1)
@@ -188,7 +202,7 @@ class AdamW(Optimizer):
 def cosine_annealing_lr_scheduler(
     lr_max: float,
     lr_min: float,
-    t_warmup: int,
+    t_warm: int,
     t_cool: int,
 ) -> Callable[[Tensor], Tensor]:
     """
@@ -211,7 +225,7 @@ def cosine_annealing_lr_scheduler(
     import torch
 
     lr_scheduler = cosine_annealing_lr_scheduler(
-                        lr_max=1e-1, lr_min=1e-3, t_warmup=100, t_cool=900)
+                        lr_max=1e-1, lr_min=1e-3, t_warm=100, t_cool=900)
 
     iters = torch.arange(1, 1001).to(torch.float32)
     lrs = [lr_scheduler(v) for v in iters]
@@ -228,15 +242,146 @@ def cosine_annealing_lr_scheduler(
         """
         t: Current training run step represented by a scalar tensor.
         """
-        if t < t_warmup:
-            return (t / t_warmup).mul_(lr_max)
+        if t < t_warm:
+            return (t / t_warm).mul_(lr_max)
         elif t <= t_cool:
             cos_eff: Tensor = (
-                (t - t_warmup).mul_(torch.pi).div_(t_cool - t_warmup).cos_().add_(1)
+                (t - t_warm).mul_(torch.pi).div_(t_cool - t_warm).cos_().add_(1)
             )
             return cos_eff.mul_(lr_max - lr_min).mul_(0.5).add_(lr_min)
         else:
             return torch.tensor(lr_min, device=t.device, dtype=t.dtype)
+
+    return scheduler
+
+
+def cos_anneal_lr_scheduler_flx(
+    lr_max: float,
+    lr_cool: float,
+    lr_cold: float,
+    t_warm: int,
+    t_cool: int,
+    t_cold: int,
+) -> Callable[[Tensor], Tensor]:
+    """
+    Cosine annealing lr scheduler which incorporates my observations in training run.
+
+    The schedule is as follow:
+        - phase [t_start, t_warm]: linear increment proportional to epoch
+        - phase [t_warm, t_cool]: cosine annealing decrement at scale of [lr_cool, lr_max]
+        - phase [t_cool, t_cold]: cosine annealing decrement at scale of [lr_cold, lr_cool]
+            - This scale is much smaller than [lr_cool, lr_max]
+        - phase [t_cold, t_max]: lr stays constant at lr_cold
+
+    This is to employ a smaller but continuously changing lr in mid- and late-phase of
+        training run to facilitate effective descent of loss function as training
+        progresses through these phases.
+
+    lr_max: Max lr to use. lr will reach this value after warmup.
+    lr_cool: lr at training step t_cool after cosine annealing descent from lr_max.
+    lr_cold: lr at training step t_cold after cosine annealing descent from lr_cool.
+    t_warm: Training epoch # where warmup ends.
+    t_cool: Training epoch # where lr cools down from lr_max to lr_cool.
+    t_cold: Training epoch # where lr moves (slowly) from lr_cool to lr_cold.
+
+    For training a tiny Transformer model like that in assignment, confirmed setup eg
+        following can lead to effective loss descent over training run:
+        - 10k training steps
+        - lr warmups to 4e-3 then cosine annealing decreases to 1e-3 at the
+            1st 5k training epochs
+            - A small fraction of training steps e.g. 20 suffice to warmup
+        - lr cosine annealing decreases from 1e-3 to 2.5e-4 at the 2nd 5k
+            training epochs
+    """
+    assert t_warm < t_cool < t_cold
+
+    def scheduler(t: Tensor) -> Tensor:
+        if t < t_warm:
+            return (t / t_warm).mul_(lr_max)
+        elif t <= t_cool:
+            cos_eff: Tensor = (
+                (t - t_warm).mul_(torch.pi).div_(t_cool - t_warm).cos_().add_(1)
+            )
+            return cos_eff.mul_(lr_max - lr_cool).mul_(0.5).add_(lr_cool)
+        elif t <= t_cold:
+            cos_eff: Tensor = (
+                (t - t_cool).mul_(torch.pi).div_(t_cold - t_cool).cos_().add_(1)
+            )
+            return cos_eff.mul_(lr_cool - lr_cold).mul_(0.5).add_(lr_cold)
+        else:
+            return torch.tensor(lr_cold, device=t.device, dtype=t.dtype)
+
+    return scheduler
+
+
+def weight_decay_scheduler(
+    wd_init: float,
+    wd_min: float,
+    t_cool: int,
+    t_cold: int,
+    wd_cool: float | None = None,
+) -> Callable[[Tensor], Tensor]:
+    """
+    wd_init: Initial weight decay rate. Prefer a larger value.
+    wd_min: Min weight decay rate to use.
+    t_cool: Training step to start decrementing weight decay from wd_init towards wd_min.
+    t_cold: Training step after which weight decay rate will stay at wd_min.
+    wd_cool: Weight decay rate to use when cooling starts. Typically wd_min < wd_cool <= wd_init
+
+    Spec:
+
+    Apply large weight decay in training run early phase.
+    After that, apply a smaller weight decay.
+    """
+
+    def scheduler(t: Tensor) -> Tensor:
+        if t < t_cool:
+            return torch.tensor(wd_init, device=t.device, dtype=t.dtype)
+        elif t <= t_cold:
+            # apply cosine annealing
+            cos_eff: Tensor = (
+                (t - t_cool).mul_(torch.pi).div_(t_cold - t_cool).cos_().add_(1)
+            )
+            wd_start = wd_init if wd_cool is None else wd_cool
+            return cos_eff.mul_(wd_start - wd_min).mul_(0.5).add_(wd_min)
+        else:
+            return torch.tensor(wd_min, device=t.device, dtype=t.dtype)
+
+    return scheduler
+
+
+def weight_decay_scheduler_flx(
+    wd_init: float,
+    wd_cool: float,
+    wd_cold: float,
+    t_warm: int,
+    t_cool: int,
+    t_cold: int,
+) -> Callable[[Tensor], Tensor]:
+    """
+    Similar rationale to cos_anneal_lr_scheduler_flx
+
+    t_warm: Training epoch # where weight decay rate ends being constant wd_init and start (wide) cosine annealing descent to wd_cool.
+    t_cool: Training epoch # where wd descends to wd_cool and starts (narrow) cosine annealing descent to wd_cold
+    t_cold: Training epoch # where wd descends to wd_cold and stays there afterwards.
+    """
+    assert t_warm < t_cool < t_cold
+
+    def scheduler(t: Tensor) -> Tensor:
+        if t < t_warm:
+            return torch.tensor(wd_init, device=t.device, dtype=t.dtype)
+        elif t <= t_cool:
+            cos_eff: Tensor = (
+                (t - t_warm).mul_(torch.pi).div_(t_cool - t_warm).cos_().add_(1)
+            )
+            return cos_eff.mul_(wd_init - wd_cool).mul_(0.5).add_(wd_cool)
+        elif t <= t_cold:
+            cos_eff: Tensor = (
+                (t - t_cool).mul_(torch.pi).div_(t_cold - t_cool).cos_().add_(1)
+            )
+            return cos_eff.mul_(wd_cool - wd_cold).mul_(0.5).add_(wd_cold)
+        else:
+            return torch.tensor(wd_cold, device=t.device, dtype=t.dtype)
 
     return scheduler
 
@@ -316,23 +461,100 @@ def get_batch(
     assert (
         batch_size + context_len <= tokens_cnt
     ), f"Input size too small to collect {batch_size} token sequences of length {context_len}"
-    in_seqs, nxt_tokens = [], []
+    in_seqs = torch.empty((batch_size, context_len), dtype=torch.int64)
+    nxt_tokens = torch.empty_like(in_seqs, dtype=torch.int64)
     # sample sequences for the batch in random
     g = rng if rng is not None else _rng
     max_possible_start_idx = tokens_cnt - context_len - 1
-    for i in g.choice(max_possible_start_idx + 1, size=batch_size, replace=False):
+    for ridx, i in enumerate(
+        g.choice(max_possible_start_idx + 1, size=batch_size, replace=False)
+    ):
         # FIXME return the same batches to verify correctness of model's math
         # for i in range(batch_size):
         # copy numpy array into a data type supported by pytorch
-        in_seqs.append(torch.from_numpy(x[i : i + context_len].astype(np.int64)))
-        nxt_tokens.append(
-            torch.from_numpy(x[i + 1 : i + 1 + context_len].astype(np.int64))
-        )
+        in_seqs[ridx, :] = torch.from_numpy(x[i : i + context_len])
+        nxt_tokens[ridx, :] = torch.from_numpy(x[i + 1 : i + 1 + context_len])
 
+    # For speedy data transfer, move resulting batched sequence to device in async
+    # More see https://docs.pytorch.org/tutorials/intermediate/pinmem_nonblock.html
     return (
-        torch.stack(in_seqs, dim=0).to(device=device),
-        torch.stack(nxt_tokens, dim=0).to(device=device),
+        in_seqs.to(device=device, non_blocking=True),
+        nxt_tokens.to(device=device, non_blocking=True),
     )
+
+
+def pass_thru(
+    x: npt.NDArray,
+    max_batch_size: int,  # to better utilize accelerator compute
+    context_len: int,
+    device: str,
+) -> Iterator[
+    tuple[Int64[Tensor, "batch_size seq_len"], Int64[Tensor, "batch_size seq_len"]]
+]:
+    """
+    Spec:
+        Pass through data in x ASAP, in exhuastive, non-overlapping manner.
+        Pass through data by max_batch_size x context_len if possible,
+            Else by a smaller batch size x context_len;
+            Else by 1 x length of remaining tokens.
+
+        Use pinned memory tensor as staging buffer to transfer data
+            (from disk) to GPU mem (async).
+
+    Args:
+        x: A 1-d list of tokens represented by a np array-like obj, usually a `memmap` for large dataset.
+        max_batch_size: Max # token sequences to return in a batch which this function will yield.
+            This means the actual # token sequences in a batch can be less than this number (e.g.
+            when passing near the end of the dataset where there is inadequate data to make up a
+            batch of size max_batch_size.
+        context_len: Max length token sequences in a batch returned by this function can take.
+            This means the actual sequence length can be less than this number.
+        device: Device where the tensors to be yield by this function will be moved to.
+    """
+    tokens_cnt = x.size
+    # Pre-allocate memory as staging buffer to transfer data from CPU to GPU
+    staged_in = torch.empty(
+        (max_batch_size, context_len), dtype=torch.int64, pin_memory=True
+    )
+    staged_nxt = torch.empty_like(staged_in, dtype=torch.long, pin_memory=True)
+    # input can take token from index 0 to tokens_cnt-2,
+    # nxt token can take token from index 1 to tokens_cnt-1
+    idx_in_start = 0
+    while idx_in_start < tokens_cnt - 1:
+        batch_size, seq_len = 0, 0
+        # attempt the largest stride first
+        idx_in_end = idx_in_start + max_batch_size * context_len - 1
+        if idx_in_end < tokens_cnt - 1:
+            batch_size, seq_len = max_batch_size, context_len
+        else:
+            # unable to take the largest stride, so make a smaller one:
+            # - A smaller batch size x context_len, OR
+            # - 1 batch x length of remaining tokens
+            tokens_remained = tokens_cnt - 2 - idx_in_start + 1
+            batch_size, tokens_res = divmod(tokens_remained, context_len)
+            if batch_size > 0:
+                idx_in_end = idx_in_start + batch_size * context_len - 1
+                seq_len = context_len
+            else:
+                idx_in_end = idx_in_start + tokens_res - 1
+                # update batch size so that tensors to be yielded below has a batch dimension
+                batch_size = 1
+                seq_len = tokens_res
+
+        # Load data to staging buffer. Avoid unnecessary copy and type casting
+        staged_in[:batch_size, :seq_len] = torch.from_numpy(
+            x[idx_in_start : idx_in_end + 1].reshape(batch_size, seq_len)
+        )
+        staged_nxt[:batch_size, :seq_len] = torch.from_numpy(
+            x[idx_in_start + 1 : idx_in_end + 2].reshape(batch_size, seq_len)
+        )
+        # Then load data to target device in async
+        yield (
+            staged_in[:batch_size, :seq_len].to(device, non_blocking=True),
+            staged_nxt[:batch_size, :seq_len].to(device, non_blocking=True),
+        )
+        # move starting index to that of next unvisited token
+        idx_in_start = idx_in_end + 1
 
 
 def save_checkpoint(
@@ -369,6 +591,69 @@ def load_checkpoint(
     return state_dict_all["iteration"]
 
 
+def gen_lr_schedule(cfg: dict) -> Callable[[Tensor], Tensor]:
+    # For match-case tutorial see https://peps.python.org/pep-0636/
+    match cfg:
+        case {"type": "fixed", "lr": float(lr)}:
+            log.info("Using fixed lr schedule: %s", cfg)
+            return lambda t: torch.tensor(lr, device=t.device, dtype=t.dtype)
+        case {
+            "type": "cosine_annealing",
+            "lr_max": float(),
+            "lr_min": float(),
+            "t_warm": int(),
+            "t_cool": int(),
+        }:
+            del cfg["type"]
+            log.info("Using cos annealing lr schedule: %s", cfg)
+            return cosine_annealing_lr_scheduler(**cfg)
+        case {
+            "type": "cosine_annealing_flx",
+            "lr_max": float(),
+            "lr_cool": float(),
+            "lr_cold": float(),
+            "t_warm": int(),
+            "t_cool": int(),
+            "t_cold": int(),
+        }:
+            del cfg["type"]
+            log.info("Using cos annealing flx lr schedule: %s", cfg)
+            return cos_anneal_lr_scheduler_flx(**cfg)
+        case _:
+            raise RuntimeError(f"Unsupported learning rate schedule config {cfg}")
+
+
+def gen_wd_schedule(cfg: dict) -> Callable[[Tensor], Tensor]:
+    match cfg:
+        case {"type": "fixed", "wd": float(wd)}:
+            log.info("Using fixed weight decay rate schedule: %s", cfg)
+            return lambda t: torch.tensor(wd, device=t.device, dtype=t.dtype)
+        case {
+            "type": "cosine_annealing",
+            "wd_init": float(),
+            "wd_min": float(),  # 'wd_cool': float | None = None,
+            "t_cool": int(),
+            "t_cold": int(),
+        }:
+            del cfg["type"]
+            log.info("Using cos annealing weight decay rate schedule: %s", cfg)
+            return weight_decay_scheduler(**cfg)
+        case {
+            "type": "cosine_annealing_flx",
+            "wd_init": float(),
+            "wd_cool": float(),
+            "wd_cold": float(),
+            "t_warm": int(),
+            "t_cool": int(),
+            "t_cold": int(),
+        }:
+            del cfg["type"]
+            log.info("Using cos annealing flx weight decay rate schedule: %s", cfg)
+            return weight_decay_scheduler_flx(**cfg)
+        case _:
+            raise RuntimeError(f"Unsupported weight decay rate schedule config {cfg}")
+
+
 # TODO OO
 def train_loop(
     train_set: npt.NDArray,
@@ -381,25 +666,24 @@ def train_loop(
     num_heads: int,
     d_ff: int,
     rope_theta: float,
-    lr: float | None,
     t_max: int,
-    t_warmup: int | None,
-    t_cool: int | None,
-    lr_max: float | None,
-    lr_min: float | None,
+    lr_schedule_cfg: dict,
+    wd_schedule_cfg: dict,
+    lr: float | None,
+    betas: tuple[float, float] | None,
     grad_clip_max_norm: float | None,
+    tensorboard_log_dir: Path,
     from_checkpoint: Path | None = None,
     checkpoint_dir: Path | None = None,
+    weight_decay: float | None = 0.01,
     checkpoint_interval: int = 1000,
     rand_seed: int | None = None,
     device: str = "cpu",
     dtype: torch.dtype | None = None,
     autograd_detect_anomaly: bool = False,
-    tensorboard_log_dir: Path | None = None,
     eval_interval: int = 50,
     metric_interval: int = 10,
     metric_grad_norm: bool = False,
-    weight_decay: float | None = 0.01,
 ) -> None:
     """
     Args:
@@ -429,20 +713,25 @@ def train_loop(
         metric_grad_norm: Compute and metric model parameter gradient L2 norm.
             Can slow down training. For debug only.
         weight_decay: Weight decay hyperparameter for AdamW.
-        TODO: Expose betas as well.
+        betas: AdamW hyperparams that control the updates to the moment estimates.
 
     TODO:
         [x] Test this w/ a very small Transformer model and try overfitting a
             single batch of training data.
         - Ability to profile CPU, RAM and accelerator usage
             - e.g. https://docs.pytorch.org/docs/stable/autograd.html#profiler
-        - Ability to monitor and visualize training run progress
+        [x] Ability to monitor and visualize training run progress
         - Different strategies to sample sequences in a batch, include but not
           limited to:
             - Fixed: Always return the same batch of sequences.
             - Given randomness: Sample w/ user-provided random seed
             - (Default) System randomness: Sample w/ randomness available on the host
     """
+    train_run_args = locals()
+    tensorboard_log_dir.mkdir(parents=True, exist_ok=True)
+    with open(tensorboard_log_dir / "train.run.args.json", "w") as f:
+        json.dump(train_run_args, f, default=str, indent=2)
+
     rng: np.random.Generator | None = None
     if rand_seed is not None:
         random.seed(rand_seed)
@@ -466,17 +755,31 @@ def train_loop(
     # Unfortunately as of Jan '26 Dynamo doesn't support Python3.12 :/
     # > Compilation with Inductor is not supported on mps as of torch version 2.6.0.
     # TODO knob to turn this on/off
-    torch_compiler_backend = "inductor"
+    torch_compile_kwargs = {"backend": "inductor"}
     if device == "mps" and torch.__version__ == "2.6.0":
-        torch_compiler_backend = "aot_eager"
-    model.compile(backend=torch_compiler_backend)
+        torch_compile_kwargs = {"backend": "aot_eager"}
+    elif device == "cuda":
+        torch_compile_kwargs.update(
+            {
+                "mode": "max-autotune",
+                #'fullgraph': True,
+            }
+        )
+        torch._dynamo.config.verbose = True
+        torch._dynamo.config.suppress_errors = False
+        if dtype == torch.float32:
+            torch.set_float32_matmul_precision("high")
 
-    lr_scheduler = cosine_annealing_lr_scheduler(
-        lr_max=lr_max, lr_min=lr_min, t_warmup=t_warmup, t_cool=t_cool
+    model.compile(**torch_compile_kwargs)
+
+    optimizer = AdamW(
+        model.parameters(),
+        lr_scheduler=gen_lr_schedule(lr_schedule_cfg),
+        wd_scheduler=gen_wd_schedule(wd_schedule_cfg),
+        lr=lr,
+        weight_decay=weight_decay,
+        betas=betas,
     )
-    optimizer = AdamW(model.parameters(),
-                      lr=lr_max, lr_scheduler=lr_scheduler,
-                      weight_decay=weight_decay)
 
     t_start = 1
     # Load checkpointed model if given
@@ -506,12 +809,12 @@ def train_loop(
             # use model(...) instead of model.forward(...) as efficiency
             # optimization eg torch.compile applies to the former.
             # predictions in shape (batch_size context_len vocab_size)
-            predictions = model(x, normalize_output=False)
+            pred_logits = model(x)
             # NOTE Per cross-entropy fn math formula it accounts
             # for prediction/probability of token at each position of each sequence
             # in the batch. So passing predictions and targets tensor w/
             # sequence length dimension makes sense
-            loss = cross_entropy_loss(predictions, targets)
+            loss = cross_entropy_loss(pred_logits, targets)
             loss.backward()
 
             if clip_grads is not None:
@@ -550,8 +853,18 @@ def train_loop(
                 f"Checkpointed model at end of epoch {t:>7d}. Took {time.time()-time_checkpoint_start:>4.2f}s"
             )
 
-        summarizer.flush()
-        summarizer.close()
+    # finally compute and metric the per-token validation loss
+    per_token_eval_loss(
+        model,
+        validation_set,
+        max_batch_size=batch_size,
+        context_len=context_len,
+        device=device,
+        summarizer=summarizer,
+        step=t,
+    )
+    summarizer.flush()
+    summarizer.close()
 
 
 @torch.no_grad()
@@ -568,11 +881,10 @@ def run_eval(
     step: Global training loop step number.
     """
     model.eval()
-    preds = model(x, normalize_output=False)
-    loss = cross_entropy_loss(preds, targets)
-
+    pred_logits = model(x)
+    loss = cross_entropy_loss(pred_logits, targets)
     # perplexity scores of sequences in batch
-    ppl_batch = perplexity(preds, targets)
+    ppl_batch = perplexity(pred_logits, targets)
     # Use log-perplexity for dashboarding
     lp_min, lp_median, lp_max = (
         ppl_batch.min().log_().item(),
@@ -592,3 +904,41 @@ def run_eval(
         step,
         now,
     )
+
+
+@torch.no_grad()
+def per_token_eval_loss(
+    model: TransformerModel,
+    validation_set: npt.NDArray,
+    max_batch_size: int,
+    context_len: int,
+    device: str,
+    summarizer: SummaryWriter,
+    step: int,
+):
+    """Compute per-token validation loss, aka the cross-entropy loss
+    averaged over all but the last tokens in the given validation dataset.
+
+    NOTE: Expensive op if given validation set is large. Run sparsely.
+
+    Discount the very last token because we don't know about its next token.
+
+    When computing this metric, avoid double-counting the loss of the same
+    token over and over. This thus requires an exhaustive and non-overlapping
+    pass of given dataset and we cannot naively reuse get_batch.
+    """
+    model.eval()
+    loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+    for batched_in, batched_targets in pass_thru(
+        validation_set, max_batch_size, context_len, device
+    ):
+        loss.add_(
+            cross_entropy_loss(model(batched_in), batched_targets).mul_(
+                batched_in.numel()
+            )
+        )
+    # compute the final result
+    loss.div_(validation_set.size - 1)
+    # metric the result
+    now = time.time()
+    summarizer.add_scalars("Loss", {"evalPerTokenAvg": loss.item()}, step, now)
