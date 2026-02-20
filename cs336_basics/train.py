@@ -867,7 +867,9 @@ def train_loop(
     summarizer.close()
 
 
-@torch.no_grad()
+# Diff. b/w torch.no_grad() See
+# https://docs.pytorch.org/docs/stable/generated/torch.autograd.grad_mode.inference_mode.html
+@torch.inference_mode()
 def run_eval(
     model: TransformerModel,
     x: Int64[Tensor, "batch_size context_len"],
@@ -906,7 +908,7 @@ def run_eval(
     )
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def per_token_eval_loss(
     model: TransformerModel,
     validation_set: npt.NDArray,

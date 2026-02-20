@@ -166,3 +166,7 @@ cython_debug/
 data
 # profiling output
 *.prof
+# tensorboard event files
+runs/
+# model training checkpoint dir
+checkpoints/
