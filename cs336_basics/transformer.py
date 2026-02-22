@@ -1,3 +1,4 @@
+from typing import Any
 from collections import namedtuple
 from math import prod
 import random
@@ -246,8 +247,14 @@ class FFN(nn.Module):
 
 
 class RotaryPositionalEmbedding(nn.Module):
+
     def __init__(
-        self, theta: float, d_k: int, max_seq_len: int, device=None, dtype=torch.float32
+        self,
+        theta: float,
+        d_k: int,
+        max_seq_len: int,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = torch.float32,
     ) -> None:
         """
         This module is used in transformer model component "Causal Multi-Head Self-Attention w/ RoPE"
@@ -296,7 +303,6 @@ class RotaryPositionalEmbedding(nn.Module):
         """
         super().__init__()
         assert d_k % 2 == 0, f"Embedding vector dimension size {d_k} is not even number"
-
         # (d_k/2,)
         inv_freq = theta ** (-torch.arange(0, d_k, 2, device=device, dtype=dtype) / d_k)
 
@@ -306,7 +312,6 @@ class RotaryPositionalEmbedding(nn.Module):
         # (max_seq_len, d_k/2)
         # freqs = torch.einsum("i,j->ij", positions, inv_freq)
         freqs = einsum(positions, inv_freq, "i,j->i j")
-
         self.register_buffer("cos", torch.cos(freqs), persistent=False)
         self.register_buffer("sin", torch.sin(freqs), persistent=False)
 
@@ -429,8 +434,7 @@ class MultiheadSelfAttention(nn.Module):
         self,
         d_model: int,
         num_heads: int,
-        theta: float | None = None,
-        max_seq_len: int | None = None,
+        token_position_embedding: RotaryPositionalEmbedding | None,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
@@ -438,7 +442,6 @@ class MultiheadSelfAttention(nn.Module):
         d_model: Dimensionality of the Transformer block inputs.
             == embedding vector dimension size d_embedding.
         num_heads: Number of heads to use in multi-head self-attention.
-        theta, max_seq_len: Parameters for initializing RoPE layer.
 
         Folllowing Vaswani et al. [2017], set d_k = d_v = d_model / h.
         NOTE it is totally feasible to have (d_k or d_v) x h > d_model; The
@@ -478,16 +481,9 @@ class MultiheadSelfAttention(nn.Module):
             )
         )
         self.num_heads = num_heads
-        if theta is not None and max_seq_len is not None:
-            # For why d_k is set to size of per-head embedding dimension, see
-            # the dimension of input of RoPE in forward() below
-            self.rope = RotaryPositionalEmbedding(
-                theta,
-                d_k=d_model // num_heads,
-                max_seq_len=max_seq_len,
-                device=device,
-                dtype=dtype,
-            )
+
+        if token_position_embedding is not None:
+            self.rope = token_position_embedding
 
     def forward(
         self,
@@ -590,16 +586,15 @@ class TransformerBlock(nn.Module):
         d_model: int,
         num_heads: int,
         d_ff: int,
-        theta: float | None = None,
-        max_seq_len: int | None = None,
         eps: float = 1e-5,
+        token_position_embedding: RotaryPositionalEmbedding | None = None,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         self.norm_pre_multihead_attention = RMSNorm(d_model, eps, device, dtype)
         self.multihead_attention = MultiheadSelfAttention(
-            d_model, num_heads, theta, max_seq_len, device, dtype
+            d_model, num_heads, token_position_embedding, device, dtype
         )
         self.norm_pre_ffn = RMSNorm(d_model, eps, device, dtype)
         self.ffn = FFN(d_model, d_ff, device, dtype)
@@ -661,6 +656,17 @@ class TransformerModel(nn.Module):
         self.token_embedding = Embedding(
             num_embeddings=vocab_size, embedding_dim=d_model, device=device, dtype=dtype
         )
+        rope = (
+            RotaryPositionalEmbedding(
+                theta=rope_theta,
+                d_k=d_model // num_heads,
+                max_seq_len=context_len,
+                device=device,
+                dtype=dtype,
+            )
+            if rope_theta is not None
+            else None
+        )
         # (batch, seq_len, d_model) -> (batch, seq_len, d_model)
         self.transformer_blocks = nn.ModuleList(
             [
@@ -668,8 +674,7 @@ class TransformerModel(nn.Module):
                     d_model,
                     num_heads,
                     d_ff,
-                    theta=rope_theta,
-                    max_seq_len=context_len,
+                    token_position_embedding=rope,
                     eps=eps,
                     device=device,
                     dtype=dtype,
