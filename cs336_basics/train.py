@@ -873,7 +873,6 @@ def train_loop(
         validation_set,
         max_batch_size=batch_size,
         context_len=context_len,
-        device=device,
         summarizer=summarizer,
         step=t,
     )
@@ -928,7 +927,6 @@ def per_token_eval_loss(
     validation_set: npt.NDArray,
     max_batch_size: int,
     context_len: int,
-    device: str,
     summarizer: SummaryWriter,
     step: int,
 ):
@@ -944,9 +942,9 @@ def per_token_eval_loss(
     pass of given dataset and we cannot naively reuse get_batch.
     """
     model.eval()
-    loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+    loss = torch.tensor(0.0, device=model.device, dtype=torch.float32)
     for batched_in, batched_targets in pass_thru(
-        validation_set, max_batch_size, context_len, device
+        validation_set, max_batch_size, context_len, model.device
     ):
         loss.add_(
             cross_entropy_loss(model(batched_in), batched_targets).mul_(

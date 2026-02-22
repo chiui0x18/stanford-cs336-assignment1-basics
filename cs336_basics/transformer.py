@@ -680,6 +680,8 @@ class TransformerModel(nn.Module):
         self.output_embedding = Linear(
             in_features=d_model, out_features=vocab_size, device=device, dtype=dtype
         )
+        self.context_len = context_len
+        self.device = device
 
     def forward(
         self,
@@ -701,7 +703,7 @@ class TransformerModel(nn.Module):
 
         For more see assignment handout section 3, page 14.
         """
-        _, seq_len = x.shape
+        seq_len = x.shape[-1]
         # Tensor holding tokens position indices in sequence
         token_positions = torch.arange(0, seq_len, device=x.device, dtype=torch.int)
         x = self.token_embedding(x)
