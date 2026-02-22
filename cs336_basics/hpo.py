@@ -6,7 +6,6 @@ from datetime import datetime
 import torch
 import numpy as np
 
-
 from cs336_basics.train import train_loop
 from cs336_basics.log import get_logger
 

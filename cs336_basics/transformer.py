@@ -11,16 +11,6 @@ from einops import einsum, reduce, rearrange, repeat
 from cs336_basics.log import get_logger
 from jaxtyping import Float, Bool, Int
 
-# https://docs.pytorch.org/docs/stable/notes/randomness.html
-# For how to generate random seed see
-# https://numpy.org/doc/stable/reference/random/index.html#module-numpy.random
-# NOTE this has negative performance implications so be aware when using it in
-# production
-# RNG_SEED = 175067350307902360991065469783437699069
-# random.seed(RNG_SEED)
-# np.random.seed(RNG_SEED)
-# torch.manual_seed(RNG_SEED)
-
 log = get_logger("transformer", level=logging.DEBUG)
 
 
@@ -723,6 +713,7 @@ class TransformerModel(nn.Module):
         return softmax(x, i=-1)
 
 
+# TODO move the acounting to above module's attribute
 ###############################################################################
 # Transformer model compute resource accounting code
 ###############################################################################

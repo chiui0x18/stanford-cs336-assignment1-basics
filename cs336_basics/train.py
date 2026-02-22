@@ -734,22 +734,29 @@ def train_loop(
 
     rng: np.random.Generator | None = None
     if rand_seed is not None:
+        # https://docs.pytorch.org/docs/stable/notes/randomness.html
+        # For how to generate random seed see
+        # https://numpy.org/doc/stable/reference/random/index.html#module-numpy.random
+        # NOTE this has negative performance implications so be aware when using it in
+        # production
         random.seed(rand_seed)
         np.random.seed(rand_seed)
         torch.manual_seed(rand_seed)
         rng = np.random.default_rng(rand_seed)
 
-    model = TransformerModel(
-        vocab_size=vocab_size,
-        context_len=context_len,
-        num_layers=num_layers,
-        d_model=d_model,
-        num_heads=num_heads,
-        d_ff=d_ff,
-        rope_theta=rope_theta,
-        device=torch.device(device),
-        dtype=dtype,
-    )
+    model_cfg = {
+        "vocab_size": vocab_size,
+        "context_len": context_len,
+        "num_layers": num_layers,
+        "d_model": d_model,
+        "num_heads": num_heads,
+        "d_ff": d_ff,
+        "rope_theta": rope_theta,
+        "eps": 1e-5,
+        "device": torch.device(device),
+        "dtype": dtype,
+    }
+    model = TransformerModel(**model_cfg)
     # optimize for efficiency when running model's tensor ops
     # See https://docs.pytorch.org/docs/stable/generated/torch.compile.html#torch-compile
     # Unfortunately as of Jan '26 Dynamo doesn't support Python3.12 :/
@@ -771,6 +778,7 @@ def train_loop(
             torch.set_float32_matmul_precision("high")
 
     model.compile(**torch_compile_kwargs)
+    model_cfg["torch_compile"] = torch_compile_kwargs
 
     optimizer = AdamW(
         model.parameters(),
@@ -846,6 +854,12 @@ def train_loop(
 
         # TODO save the model upon exhausting all epochs?
         if should_checkpoint:
+            # record model config to facilitate future use of checkpoints
+            model_cfg_fp = checkpoint_dir / f"model.cfg.json"
+            if not model_cfg_fp.exists():
+                with open(model_cfg_fp, "wt") as f:
+                    json.dump(model_cfg, f, default=str, indent=2)
+
             time_checkpoint_start = time.time()
             checkpoint_fp = checkpoint_dir / f"{t}.pt"
             save_checkpoint(model, optimizer, t, checkpoint_fp)
