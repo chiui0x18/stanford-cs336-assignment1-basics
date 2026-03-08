@@ -1,14 +1,13 @@
 import logging
 import datetime
-from typing import Optional
 
 
 class UTCISOFormatter(logging.Formatter):
     """Formatter that outputs UTC time in ISO8601 format with 'Z' suffix."""
 
-    def formatTime(self, record: logging.LogRecord, datefmt: Optional[str] = None):
+    def formatTime(self, record: logging.LogRecord, datefmt: str | None = None):
         # record.created is a POSIX timestamp (float)
-        dt = datetime.datetime.fromtimestamp(record.created, tz=datetime.timezone.utc)
+        dt = datetime.datetime.fromtimestamp(record.created, tz=datetime.UTC)
         # Example: 2025-12-27T15:50:05Z
         return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 

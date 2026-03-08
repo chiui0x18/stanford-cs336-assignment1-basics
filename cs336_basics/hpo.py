@@ -1,5 +1,5 @@
 from typing import Any
-from collections.abc import Iterator
+from collections.abc import Iterable
 from itertools import product
 from pathlib import Path
 from datetime import datetime
@@ -13,12 +13,12 @@ log = get_logger("hpo")
 
 
 def hyperparam_space(
-    batch_sizes: Iterator[int],
-    adamw_betas: Iterator[tuple[float, float]],  # each tuple is (beta1, beta2)
-    weight_decay_schedule_cfgs: Iterator[dict],
-    lr_schedule_cfgs: Iterator[dict],
+    batch_sizes: Iterable[int],
+    adamw_betas: Iterable[tuple[float, float]],  # each tuple is (beta1, beta2)
+    weight_decay_schedule_cfgs: Iterable[dict],
+    lr_schedule_cfgs: Iterable[dict],
     # TODO other hyperparams
-) -> Iterator[dict[str, Any]]:
+) -> Iterable[dict[str, Any]]:
     """
     Spec:
 
@@ -106,7 +106,7 @@ hps = hyperparam_space(
 
 for idx, hp in enumerate(hps):
     log.info("Starting run %d w/ hyperparameters %s", idx, hp)
-    run_name = f"tst-refactored-1"
+    run_name = "tst-refactored-1"
     log_dir = Path(f"./runs/{run_name}")
 
     start = datetime.now()

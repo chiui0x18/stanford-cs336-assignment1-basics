@@ -855,9 +855,9 @@ def train_loop(
         # TODO save the model upon exhausting all epochs?
         if should_checkpoint:
             # record model config to facilitate future use of checkpoints
-            model_cfg_fp = checkpoint_dir / f"model.cfg.json"
+            model_cfg_fp = checkpoint_dir / "model.cfg.json"
             if not model_cfg_fp.exists():
-                with open(model_cfg_fp, "wt") as f:
+                with open(model_cfg_fp, "w") as f:
                     json.dump(model_cfg, f, default=str, indent=2)
 
             time_checkpoint_start = time.time()

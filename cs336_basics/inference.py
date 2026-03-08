@@ -2,21 +2,23 @@ import torch
 from torch import Tensor
 from jaxtyping import Float, Int
 from cs336_basics.bpe import Tokenizer
-from cs336_basics.transformer import softmax, TransformerModel
+from cs336_basics.transformer import TransformerModel
 from cs336_basics.log import get_logger
 
 log = get_logger("inference")
 
+
 class Predictor:
 
     def __init__(
-        self, tokenizer:
-        Tokenizer, model: TransformerModel,
+        self,
+        tokenizer: Tokenizer,
+        model: TransformerModel,
         temperature: float = 0.5,
         sampling_mode: str | None = None,
         p: int | None = None,
     ) -> None:
-        '''
+        """
         sampling_mode: How to sample/pick the next token from model's
             predicted next-token probability distribution. Possible values:
             - None: Pick token w/ highest probability
@@ -24,21 +26,23 @@ class Predictor:
                 default RNG for randomness.
         temperature: Temperature scaling parameter. Smaller value means
             more contrast b/w token w/ max probability and others.
-        '''
+        """
         self.tokenizer = tokenizer
         self.model = model
-        assert temperature > 0, 'Temperature scaling parameter must be positive'
+        assert temperature > 0, "Temperature scaling parameter must be positive"
         self.temperature = temperature
 
         match sampling_mode:
             case None:
                 self.sampling_mode = None
-            case 'nucleus':
-                assert p is not None and p > 0, 'Nucleus sampling threshold must be positive'
+            case "nucleus":
+                assert (
+                    p is not None and p > 0
+                ), "Nucleus sampling threshold must be positive"
                 self.sampling_mode = sampling_mode
                 self.p = p
             case _:
-                raise RuntimeError(f'Unsupported sampling mode: {sampling_mode}')
+                raise RuntimeError(f"Unsupported sampling mode: {sampling_mode}")
 
         self._initiated = False
 
@@ -55,17 +59,17 @@ class Predictor:
         self._initiated = True
 
     def _buffer(self, tokens: list[int]):
-        '''Add given tokens to context window staging buffer. Assume tokens can fit in.
+        """Add given tokens to context window staging buffer. Assume tokens can fit in.
 
         Move buf end ptr to fit prompt's tokens into ctx.
         If accumulated data overflows buf:
             Overflow happens if end ptr oversteps start ptr *after* it moves.
             Discard oldest data by moving buf start ptr so that it is after end ptr by 1.
-            
+
         Init/Empty buf: s == e < 0
         Has data. Data size < buf size: s < e
         Overflow: New data comes in, move e to new pos to store new data and find it oversteps s (aka e == s)
-        '''
+        """
         buf, s, e = self.ctx_buf, self.buf_idx_s, self.buf_idx_e
         buf_len = len(buf)
         for t in tokens:
@@ -75,23 +79,23 @@ class Predictor:
                 s = e = 0
             else:
                 # Data exists in buf and e indexes existent data. Find a new slot by moving e
-                e = (e+1) % buf_len
+                e = (e + 1) % buf_len
                 # check if the move results in overflow
                 if e == s:
                     # TODO handle overflow by dropping the oldest data
-                    s = (s+1) % buf_len
+                    s = (s + 1) % buf_len
             # save token to buf
             buf[e] = t
         # update buf state stored in instance for future ops
         self.buf_idx_s, self.buf_idx_e = s, e
 
     def _buffered_tokens(self) -> list[int]:
-        '''Return all tokens in the context window staging buffer in FIFO order.'''
+        """Return all tokens in the context window staging buffer in FIFO order."""
         buf, s, e = self.ctx_buf, self.buf_idx_s, self.buf_idx_e
         if s <= e:
-            return buf[s:e+1]
+            return buf[s : e + 1]
         # s > e: Wrap-around case
-        return buf[s:] + buf[:e+1]
+        return buf[s:] + buf[: e + 1]
 
     @torch.inference_mode()
     def generate(
@@ -144,7 +148,9 @@ class Predictor:
 
         while len(tokens_out) < out_tokens_limit:
             # shape (1 seq_len)
-            t_in = torch.tensor([self._buffered_tokens()], device=self.device, dtype=torch.int64)
+            t_in = torch.tensor(
+                [self._buffered_tokens()], device=self.device, dtype=torch.int64
+            )
             # shape (1 seq_len vocab_size)
             logits = self.model(t_in)
             idx = self.sample_next_token(logits)
@@ -157,7 +163,9 @@ class Predictor:
 
         return self.tokenizer.decode(tokens_out)
 
-    def sample_next_token(self, logits: Float[Tensor, '1 seq_len vocab_size']) -> Int[Tensor, '']:
+    def sample_next_token(
+        self, logits: Float[Tensor, "1 seq_len vocab_size"]
+    ) -> Int[Tensor, ""]:
         if self.sampling_mode is None:
             # Naive sampling by picking the id of token w/ highest unormalized probability
             return logits[0, -1, :].argmax()
@@ -181,7 +189,7 @@ class Predictor:
         token_ids_drop = token_ids_sorted[over_threshold]
         # Set the logits of tokens to drop to -inf so that the interpreted probability
         # of picking them is 0 after softmax
-        logits_sorted[token_ids_drop] = -float('inf')
+        logits_sorted[token_ids_drop] = -float("inf")
         # Re-compute softmax then randomly sample 1 out of the remaining tokens.
         # NOTE because we have set the probability of tokens to drop to 0,
         # multinomial sampling will therefore exclude them.
