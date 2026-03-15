@@ -1,4 +1,3 @@
-from math import prod
 import logging
 import torch
 from torch import Tensor
@@ -49,6 +48,7 @@ class Linear(nn.Module):
         # But the crucial idea is to achieve correctness and functionality before
         # even worry about performance / optimization. So stay disciplined.
         return einsum(x, self.w, "... d_in , d_out d_in -> ... d_out")
+
 
 # FIXME remove later
 #    def num_params(self, backward: bool | None = False) -> int:
@@ -275,7 +275,6 @@ class FFN(nn.Module):
 
 
 class RotaryPositionalEmbedding(nn.Module):
-
     def __init__(
         self,
         theta: float,
@@ -753,8 +752,8 @@ class TransformerModel(nn.Module):
         return softmax(x, i=-1)
 
     def num_learnable_params_ground_truth(self) -> int:
-        '''Total number of Module's learnable parameters.'''
-        return sum([ p.numel() for p in self.parameters() ])
+        """Total number of Module's learnable parameters."""
+        return sum([p.numel() for p in self.parameters()])
 
     @staticmethod
     def est_num_params(
@@ -771,10 +770,14 @@ class TransformerModel(nn.Module):
 
         NOTE it does NOT consider intermediate activations.
 
-        Comparison b/w this method's result and that of
+        This is precise enough for practical estimation, cuz:
+        - Comparison b/w this method's result and that of
         `self.num_learnable_params_ground_truth()` wrt
-        # learnable model params yields ~0.002% diff, enough
-        as a practical approximation.
+        # learnable model params yields ~0.002% diff
+        - Comparison w/ actual model parameter total size
+        from Pytorch profiler (all model parameters of type
+        torch.float32) yields 0.5 - 1% diff
+        (note this method underestimates)
 
         Args:
             learnable: Consider only learnable parameters or not. If true,
@@ -821,42 +824,89 @@ class TransformerModel(nn.Module):
             # momentum m and v as optimizer's state during training run
             num_optimizer_state_params = 2 * num_learnable_params
 
-            running_cnt += (
-                num_learnable_param_grads + num_optimizer_state_params
-            )
+            running_cnt += num_learnable_param_grads + num_optimizer_state_params
 
         non_learnable_params = (
             0
             if learnable
-            else (
-                # RoPE
-                d_model//num_heads * context_len
-            )
+            # RoPE
+            else (d_model // num_heads * context_len)
         )
 
         return running_cnt + non_learnable_params
 
     @staticmethod
-    def est_num_activations():
-        '''
+    def est_num_activations(
+        batch_size: int,
+        seq_len: int,
+        vocab_size: int,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        num_layers: int,
+    ):
+        """
+        This is close enough for practical estimation, cuz comparison w/
+        activation total size in bytes from Pytorch profiler yields
+        0.2 - 1.5% diff (datatype of all model params set to torch.float32)
+        NOTE this method underestimates.
+
         Spec:
 
-        Initial state this shall be close to est_num_params.
-        Peak state likely appears when the call stack of model's forward pass gets highest
+        First define activations: Activations are the intermediate tensors created
+        during model's forward pass. Based on our purpose we are free to choose which
+        such tensors count as activations. One option is to account only intermediate
+        tensors which are necessary to compute gradients in backward pass as activations.
+        Example see [Korthikanti et al. (2022)](https://arxiv.org/abs/2205.05198)
 
-        Below we visualize the call stack when running model's forward pass:
-        pred = model(x), where x in shape (bs, seq)
-                input_embedding
-                    lookup embedding vectors for input tokens, resultant tensor (bs, seq, d_model)
-                each TransformerBlock
-                    RMSNorm 
-                    MultiheadSelfAttention
-                    RMSNorm 
-                    FFN
-                output RMSNorm
-                output embedding / linear
-        '''
-        raise NotImplementedError
+        Here we implement the accounting option mentioned above, w/ assumption that some
+        operations (e.g. `einops.rearrange`) effectively create pytorch tensor view and
+        incur no extra mem allocation, which is likely why this implementation underestimates.
+
+        First split the Transformer model based on its conceptual components, then
+        compute activations created by each component in divide and conquer manner, then
+        sum them up to get the final estimate.
+
+        Key of correct accounting:
+        - Be clear about the shape of intermediate tensors created in each components.
+        - Avoid double counting the output tensor of an intermediate model layer, eg that
+        of norm before multi-head self attention and the input tensor of its next layer
+        -- They refer to the same tensor.
+        """
+        activations_rms_norm = batch_size * seq_len * (d_model + 1)
+        activations_per_transformer_block = (
+            # pre-attention norm
+            activations_rms_norm
+            +
+            # multihead self attention w/ RoPE w/ causal masking
+            (
+                9 * batch_size * seq_len * d_model
+                + 3 * batch_size * num_heads * (seq_len**2)
+                + seq_len**2
+            )
+            +
+            # pre-ffn norm
+            activations_rms_norm
+            +
+            # ffn
+            (4 * batch_size * seq_len * d_ff + batch_size * seq_len * d_model)
+        )
+        running_cnt = (
+            # input token embedding
+            batch_size * seq_len * d_model
+            +
+            # activations created by all TransformerBlocks
+            num_layers * activations_per_transformer_block
+            +
+            # post TransformerBlocks norm
+            activations_rms_norm
+            +
+            # output embedding
+            batch_size * seq_len * vocab_size
+        )
+
+        return running_cnt
+
 
 # Reference impl per https://www.adamcasson.com/posts/transformer-flops
 
